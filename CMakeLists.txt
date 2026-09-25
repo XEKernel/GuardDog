@@ -125,6 +125,7 @@ set_target_properties(GuardDogWatchdog PROPERTIES LINK_FLAGS "/ENTRY:wmainCRTSta
 # ---------------------------------------------------------------------------
 add_executable(GuardDogUI WIN32
     src/UI/TrayApp.cpp
+    src/UI/GuardDogUI.manifest   # 声明 comctl32 v6 视觉样式（扁平外观）与 DPI 感知
 )
 
 target_link_libraries(GuardDogUI PRIVATE GuardDogCore)

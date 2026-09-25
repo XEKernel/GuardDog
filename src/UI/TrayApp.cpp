@@ -32,10 +32,11 @@ constexpr wchar_t kWindowClassName[] = L"GuardDogMainWindow";
 constexpr wchar_t kRunKeyPath[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 constexpr wchar_t kRunValueName[] = L"GuardDogUI";
 
-constexpr int kWindowWidth = 780;
-constexpr int kWindowHeight = 580;
-constexpr int kMinWindowWidth = 660;
-constexpr int kMinWindowHeight = 440;
+constexpr int kWindowWidth = 1020;
+constexpr int kWindowHeight = 740;
+constexpr int kMinWindowWidth = 920;
+constexpr int kMinWindowHeight = 620;
+constexpr int kUiFontSize = 10;   // 窗口放大后字号同步放大，避免显得空旷
 
 // 控件与命令 ID（托盘菜单复用同一套 ID，命令处理只需写一份）
 enum ControlId : int {
@@ -47,6 +48,7 @@ enum ControlId : int {
     kIdConfig,
     kIdAllowLast,
     kIdWatchdog,
+    kIdServiceCtrl,
     kIdHide,
     kIdAbout,
     kIdExit,
@@ -55,9 +57,96 @@ enum ControlId : int {
 HWND g_mainWindow = nullptr;
 HWND g_statusText = nullptr;
 HWND g_logEdit = nullptr;
+HWND g_serviceButton = nullptr;  // 文字随服务状态在"启动服务/停止服务"间切换
 std::vector<HWND> g_buttons;
 NOTIFYICONDATAW g_trayData{};
 bool g_startedHidden = false;
+HFONT g_uiFont = nullptr;    // 界面字体
+HFONT g_monoFont = nullptr;  // 日志字体
+
+// ---------------------------------------------------------------------------
+// 字体
+//
+// 不用 DEFAULT_GUI_FONT：那是上世纪的 System 字体，中文落到宋体点阵上，
+// 没有抗锯齿，看起来是明显的"像素风"。
+// 优先选 Microsoft YaHei UI（Win10/11 的系统 UI 字体），退回雅黑、Segoe UI，
+// 全都没有才回退到系统默认——保证在任何系统上都不至于没字体可用。
+// ---------------------------------------------------------------------------
+
+bool IsFontAvailable(const wchar_t* faceName) {
+    HDC deviceContext = GetDC(nullptr);
+    if (deviceContext == nullptr) {
+        return false;
+    }
+
+    LOGFONTW query{};
+    query.lfCharSet = DEFAULT_CHARSET;
+    wcscpy_s(query.lfFaceName, faceName);
+
+    bool found = false;
+    EnumFontFamiliesExW(
+        deviceContext, &query,
+        [](const LOGFONTW*, const TEXTMETRICW*, DWORD, LPARAM parameter) -> int {
+            *reinterpret_cast<bool*>(parameter) = true;
+            return 0;  // 找到一个就停
+        },
+        reinterpret_cast<LPARAM>(&found), 0);
+
+    ReleaseDC(nullptr, deviceContext);
+    return found;
+}
+
+HFONT CreateFontBySize(const wchar_t* faceName, int pointSize, bool monospaced) {
+    LOGFONTW logFont{};
+    HDC deviceContext = GetDC(nullptr);
+    logFont.lfHeight =
+        -MulDiv(pointSize, GetDeviceCaps(deviceContext, LOGPIXELSY), 72);  // 按 DPI 换算
+    ReleaseDC(nullptr, deviceContext);
+
+    logFont.lfWeight = FW_NORMAL;
+    logFont.lfCharSet = DEFAULT_CHARSET;
+    logFont.lfQuality = CLEARTYPE_QUALITY;  // 关键：开启抗锯齿，消除点阵颗粒感
+    logFont.lfPitchAndFamily = monospaced ? FIXED_PITCH : VARIABLE_PITCH;
+    wcscpy_s(logFont.lfFaceName, faceName);
+
+    HFONT font = CreateFontIndirectW(&logFont);
+    if (font != nullptr) {
+        return font;
+    }
+    return static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+}
+
+const wchar_t* PickUiFace() {
+    if (IsFontAvailable(L"Microsoft YaHei UI")) {
+        return L"Microsoft YaHei UI";
+    }
+    if (IsFontAvailable(L"Microsoft YaHei")) {
+        return L"Microsoft YaHei";
+    }
+    if (IsFontAvailable(L"Segoe UI")) {
+        return L"Segoe UI";
+    }
+    return L"Tahoma";
+}
+
+void CreateFonts() {
+    g_uiFont = CreateFontBySize(PickUiFace(), kUiFontSize, false);
+    // 日志区用等宽字体更好读（时间戳与级别能对齐）；
+    // Consolas 不含中文，找不到时退回界面字体，避免中文回退成点阵宋体。
+    const wchar_t* logFace = IsFontAvailable(L"Consolas") ? L"Consolas" : PickUiFace();
+    g_monoFont = CreateFontBySize(logFace, kUiFontSize, true);
+}
+
+void DestroyFonts() {
+    if (g_uiFont != nullptr) {
+        DeleteObject(g_uiFont);
+        g_uiFont = nullptr;
+    }
+    if (g_monoFont != nullptr) {
+        DeleteObject(g_monoFont);
+        g_monoFont = nullptr;
+    }
+}
 
 // ---------------------------------------------------------------------------
 // 小工具
@@ -131,7 +220,9 @@ std::wstring StripStatusPrefix(const std::wstring& response) {
 // ---------------------------------------------------------------------------
 
 void CreateControls(HWND window) {
-    const HFONT font = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+    const HFONT uiFont = (g_uiFont != nullptr) ? g_uiFont
+                                               : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+    const HFONT logFont = (g_monoFont != nullptr) ? g_monoFont : uiFont;
 
     g_statusText = CreateWindowExW(0, L"STATIC", L"正在读取状态…",
                                    WS_CHILD | WS_VISIBLE | SS_LEFT | SS_SUNKEN, 0, 0, 0, 0, window,
@@ -150,10 +241,11 @@ void CreateControls(HWND window) {
         const wchar_t* text;
     };
     const ButtonSpec specs[] = {
-        {kIdRefresh, L"刷新状态"},   {kIdFullLog, L"完整日志"},
-        {kIdScan, L"手动扫描"},      {kIdConfig, L"打开配置"},
-        {kIdAllowLast, L"临时放行"}, {kIdWatchdog, L"看门狗"},
-        {kIdHide, L"隐藏到托盘"},    {kIdExit, L"退出"},
+        {kIdRefresh, L"刷新状态"},     {kIdFullLog, L"完整日志"},
+        {kIdScan, L"手动扫描"},        {kIdConfig, L"打开配置"},
+        {kIdAllowLast, L"临时放行"},   {kIdWatchdog, L"看门狗"},
+        {kIdServiceCtrl, L"启动服务"}, {kIdHide, L"隐藏到托盘"},
+        {kIdExit, L"退出"},
     };
 
     for (const ButtonSpec& spec : specs) {
@@ -162,24 +254,27 @@ void CreateControls(HWND window) {
                                       reinterpret_cast<HMENU>(static_cast<INT_PTR>(spec.id)),
                                       nullptr, nullptr);
         if (button != nullptr) {
-            SendMessageW(button, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+            SendMessageW(button, WM_SETFONT, reinterpret_cast<WPARAM>(uiFont), TRUE);
             g_buttons.push_back(button);
+            if (spec.id == kIdServiceCtrl) {
+                g_serviceButton = button;
+            }
         }
     }
 
     if (g_statusText != nullptr) {
-        SendMessageW(g_statusText, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+        SendMessageW(g_statusText, WM_SETFONT, reinterpret_cast<WPARAM>(uiFont), TRUE);
     }
     if (g_logEdit != nullptr) {
-        SendMessageW(g_logEdit, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+        SendMessageW(g_logEdit, WM_SETFONT, reinterpret_cast<WPARAM>(logFont), TRUE);
     }
 }
 
 void LayoutControls(HWND /*window*/, int width, int height) {
     constexpr int margin = 10;
     constexpr int statusHeight = 96;
-    constexpr int buttonHeight = 32;
-    constexpr int buttonWidth = 112;
+    constexpr int buttonHeight = 34;
+    constexpr int buttonWidth = 106;  // 9 个按钮 + 8 个间隔要能放进 1020 宽的窗口
     constexpr int gap = 6;
 
     if (g_statusText != nullptr) {
@@ -205,7 +300,16 @@ void LayoutControls(HWND /*window*/, int width, int height) {
 // 命令处理
 // ---------------------------------------------------------------------------
 
+// 前向声明：RefreshStatus 需要先查询服务状态来决定按钮文字
+bool IsMainServiceRunning();
+void ControlMainService(bool start);
+
 void RefreshStatus() {
+    // 按钮文字跟着服务状态走，用户一眼就知道点下去会发生什么
+    if (g_serviceButton != nullptr) {
+        SetWindowTextW(g_serviceButton, IsMainServiceRunning() ? L"停止服务" : L"启动服务");
+    }
+
     std::wstring response;
     if (!SendCommand(L"STATUS", response)) {
         if (g_statusText != nullptr) {
@@ -298,6 +402,60 @@ void AllowLastTarget() {
     }
 }
 
+// 查询主服务当前是否在运行（用于决定按钮文字）
+bool IsMainServiceRunning() {
+    SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+    if (scm == nullptr) {
+        return false;
+    }
+
+    bool running = false;
+    SC_HANDLE service = OpenServiceW(scm, GuardDog::Constants::kServiceName, SERVICE_QUERY_STATUS);
+    if (service != nullptr) {
+        SERVICE_STATUS status{};
+        if (QueryServiceStatus(service, &status)) {
+            running = (status.dwCurrentState == SERVICE_RUNNING ||
+                       status.dwCurrentState == SERVICE_START_PENDING);
+        }
+        CloseServiceHandle(service);
+    }
+    CloseServiceHandle(scm);
+    return running;
+}
+
+// 启动/停止主服务。
+//
+// 服务控制需要管理员权限，而前端刻意以普通用户运行（不让整个界面常驻高权限）。
+// 因此这里用 runas 拉起一个**提升的 sc.exe** 完成任务——UAC 只在这一个动作上出现，
+// 界面的其余部分始终是普通权限。
+void ControlMainService(bool start) {
+    SHELLEXECUTEINFOW info{};
+    info.cbSize = sizeof(info);
+    info.fMask = SEE_MASK_NOCLOSEPROCESS;
+    info.lpVerb = L"runas";  // 触发 UAC 提升
+    info.lpFile = L"sc.exe";
+    info.lpParameters = start ? L"start GuardDogService" : L"stop GuardDogService";
+    info.nShow = SW_HIDE;
+
+    if (!ShellExecuteExW(&info)) {
+        const DWORD error = GetLastError();
+        if (error == ERROR_CANCELLED) {
+            return;  // 用户取消了 UAC，静默返回即可
+        }
+        ShowInfo(L"无法发起服务控制操作（需要管理员权限）。", MB_OK | MB_ICONWARNING);
+        return;
+    }
+
+    if (info.hProcess != nullptr) {
+        WaitForSingleObject(info.hProcess, 20000);
+        CloseHandle(info.hProcess);
+    }
+
+    Sleep(2000);  // 给 SCM 一点时间完成状态切换
+    RefreshStatus();
+    RefreshLog();
+}
+
 void ShowWatchdogStatus() {
     std::wstring text;
 
@@ -375,6 +533,8 @@ void ShowTrayMenu(HWND window) {
     AppendMenuW(menu, MF_STRING, kIdScan, L"手动扫描（只读）");
     AppendMenuW(menu, MF_STRING, kIdAllowLast, L"临时放行最近处置的目标");
     AppendMenuW(menu, MF_STRING, kIdWatchdog, L"看门狗状态");
+    AppendMenuW(menu, MF_STRING, kIdServiceCtrl,
+                IsMainServiceRunning() ? L"停止防护服务" : L"启动防护服务");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, kIdConfig, L"打开配置文件");
     AppendMenuW(menu, MF_STRING, kIdAbout, L"关于");
@@ -398,6 +558,7 @@ void ShowTrayMenu(HWND window) {
         case kIdScan:       RunScan(); break;
         case kIdAllowLast:  AllowLastTarget(); break;
         case kIdWatchdog:   ShowWatchdogStatus(); break;
+        case kIdServiceCtrl: ControlMainService(!IsMainServiceRunning()); break;
         case kIdConfig:     OpenConfig(); break;
         case kIdAbout:      ShowAbout(); break;
         case kIdHide:       HideMainWindow(); break;
@@ -414,6 +575,7 @@ void HandleCommand(int id) {
         case kIdConfig:     OpenConfig(); break;
         case kIdAllowLast:  AllowLastTarget(); break;
         case kIdWatchdog:   ShowWatchdogStatus(); break;
+        case kIdServiceCtrl: ControlMainService(!IsMainServiceRunning()); break;
         case kIdHide:       HideMainWindow(); break;
         case kIdExit:       DestroyWindow(g_mainWindow); break;
         default: break;
@@ -427,6 +589,7 @@ void HandleCommand(int id) {
 LRESULT CALLBACK MainWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
         case WM_CREATE:
+            CreateFonts();  // 控件创建前先把字体准备好
             CreateControls(window);
             return 0;
 
@@ -461,6 +624,7 @@ LRESULT CALLBACK MainWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM
 
         case WM_DESTROY:
             Shell_NotifyIconW(NIM_DELETE, &g_trayData);
+            DestroyFonts();
             PostQuitMessage(0);
             return 0;
 
