@@ -71,6 +71,7 @@ constexpr char kDefaultConfigJson[] = R"JSON({
     "clean_wmi_subscriptions": true,
     "clean_legacy_on_start": false,
     "remove_whole_directory": false,
+    "startup_mode": "gui",
     "log_level": "info"
   }
 }
@@ -327,6 +328,14 @@ bool ConfigManager::ParseConfig(const JsonValue& root, Config& config, std::wstr
             settings.Find(L"clean_legacy_on_start").AsBool(config.settings.cleanLegacyOnStart);
         config.settings.removeWholeDirectory =
             settings.Find(L"remove_whole_directory").AsBool(config.settings.removeWholeDirectory);
+        config.settings.startupMode = settings.Find(L"startup_mode").AsString(config.settings.startupMode);
+        if (_wcsicmp(config.settings.startupMode.c_str(), L"gui") != 0 &&
+            _wcsicmp(config.settings.startupMode.c_str(), L"hidden") != 0) {
+            // 写错就退回默认值，而不是让前端因为一个拼写错误就完全没有界面
+            GD_LOG_WARN(L"startup_mode 取值无法识别（%s），已回退为 gui",
+                        config.settings.startupMode.c_str());
+            config.settings.startupMode = L"gui";
+        }
         config.settings.logLevel = settings.Find(L"log_level").AsString(config.settings.logLevel);
     } else if (!settings.IsNull()) {
         error = L"settings 必须是对象";

@@ -1,10 +1,14 @@
-// GuardDog 托盘 UI（阶段三）。
+// GuardDog 前端（阶段三）：主窗口 + 托盘图标。
+//
+// 启动模式由配置文件决定（settings.startup_mode），启动时读取一次：
+//   gui    —— 显示主窗口
+//   hidden —— 纯隐藏：不显示任何窗口，仅驻留托盘图标；双击托盘或右键"显示主窗口"可唤出
 //
 // 设计取向：这是一个"看得见"的通道，不是第二个控制台。
 //   - 只提供查询类动作（状态、日志、只读扫描）与"临时放行"这一个干预类动作；
-//   - 刻意不提供"删除/终止"类命令：UI 以普通用户身份运行，
+//   - 刻意不提供"删除/终止"类命令：前端以普通用户身份运行，
 //     把危险动作经管道暴露出去等于给本机任何进程开了一个提权后门；
-//   - 退出只结束 UI 进程，不会影响防护服务本身。
+//   - 关闭主窗口只是隐藏到托盘，不会停止防护服务；退出程序也不影响服务。
 //
 // 编译为 GUI 子系统，入口 wWinMain，无控制台窗口。
 
@@ -12,9 +16,11 @@
 #include <shellapi.h>
 
 #include <string>
+#include <vector>
 
 #include "Core/Constants.h"
 #include "Core/IPC.h"
+#include "Core/Json.h"
 
 #pragma comment(lib, "shell32.lib")
 
@@ -22,17 +28,44 @@ namespace {
 
 constexpr UINT kTrayIconId = 1;
 constexpr UINT kTrayCallbackMessage = WM_APP + 1;
-constexpr wchar_t kWindowClassName[] = L"GuardDogTrayWindow";
+constexpr wchar_t kWindowClassName[] = L"GuardDogMainWindow";
 constexpr wchar_t kRunKeyPath[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 constexpr wchar_t kRunValueName[] = L"GuardDogUI";
 
-HINSTANCE g_instance = nullptr;
-HWND g_window = nullptr;
+constexpr int kWindowWidth = 780;
+constexpr int kWindowHeight = 580;
+constexpr int kMinWindowWidth = 660;
+constexpr int kMinWindowHeight = 440;
+
+// 控件与命令 ID（托盘菜单复用同一套 ID，命令处理只需写一份）
+enum ControlId : int {
+    kIdStatusText = 2000,
+    kIdLogEdit,
+    kIdRefresh = 2010,
+    kIdFullLog,
+    kIdScan,
+    kIdConfig,
+    kIdAllowLast,
+    kIdWatchdog,
+    kIdHide,
+    kIdAbout,
+    kIdExit,
+};
+
+HWND g_mainWindow = nullptr;
+HWND g_statusText = nullptr;
+HWND g_logEdit = nullptr;
+std::vector<HWND> g_buttons;
 NOTIFYICONDATAW g_trayData{};
+bool g_startedHidden = false;
+
+// ---------------------------------------------------------------------------
+// 小工具
+// ---------------------------------------------------------------------------
 
 // 取自身 exe 路径。
-// 这里自己实现而不复用 ServiceInstaller 的同名函数：UI 以普通用户运行，
-// 不应该为了一个取路径的动作去链接整套服务安装逻辑。
+// 自己实现而不复用 ServiceInstaller 的同名函数：前端以普通用户运行，
+// 不该为了一个取路径的动作去链接整套服务安装逻辑。
 std::wstring GetSelfPath() {
     std::wstring path(MAX_PATH, L'\0');
     for (;;) {
@@ -49,19 +82,25 @@ std::wstring GetSelfPath() {
     }
 }
 
-enum MenuId : UINT {
-    kMenuStatus = 1,
-    kMenuLog,
-    kMenuConfig,
-    kMenuScan,
-    kMenuAllowLast,
-    kMenuWatchdog,
-    kMenuAbout,
-    kMenuExit,
-};
+std::wstring ConfigPath() {
+    return std::wstring(GuardDog::Constants::kProgramDataDir) + L"\\" +
+           GuardDog::Constants::kConfigFileName;
+}
+
+// 启动时读取启动模式。读不到或取值异常都回退到 gui——
+// 前端是用户的可见通道，宁可多显示一个窗口，也不要让用户找不到入口。
+std::wstring ReadStartupMode() {
+    std::wstring error;
+    const GuardDog::JsonValue root = GuardDog::JsonValue::ParseFile(ConfigPath(), &error);
+    if (root.IsNull()) {
+        return L"gui";
+    }
+    return root.Find(L"settings").Find(L"startup_mode").AsString(L"gui");
+}
 
 void ShowInfo(const std::wstring& text, UINT flags = MB_OK | MB_ICONINFORMATION) {
-    MessageBoxW(nullptr, text.c_str(), L"GuardDog", flags | MB_SETFOREGROUND);
+    MessageBoxW(g_mainWindow != nullptr && IsWindowVisible(g_mainWindow) ? g_mainWindow : nullptr,
+                text.c_str(), L"GuardDog", flags | MB_SETFOREGROUND);
 }
 
 // 与服务通信；失败时给出明确原因，而不是静默无响应
@@ -78,8 +117,7 @@ bool SendCommand(const std::wstring& request, std::wstring& response) {
 }
 
 UINT FlagsForResponse(const std::wstring& response) {
-    const bool isError = response.rfind(L"ERR|", 0) == 0;
-    return MB_OK | (isError ? MB_ICONWARNING : MB_ICONINFORMATION);
+    return MB_OK | (response.rfind(L"ERR|", 0) == 0 ? MB_ICONWARNING : MB_ICONINFORMATION);
 }
 
 // 把 "OK|" / "ERR|" 之后的内容取出来展示
@@ -88,17 +126,118 @@ std::wstring StripStatusPrefix(const std::wstring& response) {
     return separator == std::wstring::npos ? response : response.substr(separator + 1);
 }
 
-void ShowStatus() {
-    std::wstring response;
-    if (!SendCommand(L"STATUS", response)) {
-        return;
+// ---------------------------------------------------------------------------
+// 窗口布局
+// ---------------------------------------------------------------------------
+
+void CreateControls(HWND window) {
+    const HFONT font = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+
+    g_statusText = CreateWindowExW(0, L"STATIC", L"正在读取状态…",
+                                   WS_CHILD | WS_VISIBLE | SS_LEFT | SS_SUNKEN, 0, 0, 0, 0, window,
+                                   reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdStatusText)),
+                                   nullptr, nullptr);
+
+    g_logEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                                WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE |
+                                    ES_READONLY | ES_AUTOVSCROLL,
+                                0, 0, 0, 0, window,
+                                reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdLogEdit)), nullptr,
+                                nullptr);
+
+    struct ButtonSpec {
+        int id;
+        const wchar_t* text;
+    };
+    const ButtonSpec specs[] = {
+        {kIdRefresh, L"刷新状态"},   {kIdFullLog, L"完整日志"},
+        {kIdScan, L"手动扫描"},      {kIdConfig, L"打开配置"},
+        {kIdAllowLast, L"临时放行"}, {kIdWatchdog, L"看门狗"},
+        {kIdHide, L"隐藏到托盘"},    {kIdExit, L"退出"},
+    };
+
+    for (const ButtonSpec& spec : specs) {
+        HWND button = CreateWindowExW(0, L"BUTTON", spec.text, WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                                      0, 0, 0, 0, window,
+                                      reinterpret_cast<HMENU>(static_cast<INT_PTR>(spec.id)),
+                                      nullptr, nullptr);
+        if (button != nullptr) {
+            SendMessageW(button, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+            g_buttons.push_back(button);
+        }
     }
-    ShowInfo(StripStatusPrefix(response), FlagsForResponse(response));
+
+    if (g_statusText != nullptr) {
+        SendMessageW(g_statusText, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+    }
+    if (g_logEdit != nullptr) {
+        SendMessageW(g_logEdit, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+    }
 }
 
-void ShowLog() {
+void LayoutControls(HWND /*window*/, int width, int height) {
+    constexpr int margin = 10;
+    constexpr int statusHeight = 96;
+    constexpr int buttonHeight = 32;
+    constexpr int buttonWidth = 112;
+    constexpr int gap = 6;
+
+    if (g_statusText != nullptr) {
+        MoveWindow(g_statusText, margin, margin, width - margin * 2, statusHeight, TRUE);
+    }
+
+    const int logTop = margin + statusHeight + gap;
+    const int logHeight = height - logTop - buttonHeight - margin * 2 - gap;
+    if (g_logEdit != nullptr) {
+        MoveWindow(g_logEdit, margin, logTop, width - margin * 2,
+                   logHeight > 60 ? logHeight : 60, TRUE);
+    }
+
+    int x = margin;
+    const int y = height - buttonHeight - margin;
+    for (HWND button : g_buttons) {
+        MoveWindow(button, x, y, buttonWidth, buttonHeight, TRUE);
+        x += buttonWidth + gap;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 命令处理
+// ---------------------------------------------------------------------------
+
+void RefreshStatus() {
+    std::wstring response;
+    if (!SendCommand(L"STATUS", response)) {
+        if (g_statusText != nullptr) {
+            SetWindowTextW(g_statusText, L"无法连接到 GuardDog 服务。\r\n"
+                                        L"请确认 GuardDogService 已启动。");
+        }
+        return;
+    }
+    if (g_statusText != nullptr) {
+        const std::wstring text = StripStatusPrefix(response);
+        SetWindowTextW(g_statusText, text.c_str());
+    }
+}
+
+void RefreshLog() {
     std::wstring response;
     if (!SendCommand(L"LOG|200", response)) {
+        return;
+    }
+    if (g_logEdit != nullptr) {
+        const std::wstring text = StripStatusPrefix(response);
+        SetWindowTextW(g_logEdit, text.c_str());
+        // 滚到底部，让用户直接看到最新记录
+        SendMessageW(g_logEdit, EM_SETSEL, 0, -1);
+        SendMessageW(g_logEdit, EM_SETSEL, static_cast<WPARAM>(-1), static_cast<LPARAM>(-1));
+        SendMessageW(g_logEdit, EM_SCROLLCARET, 0, 0);
+    }
+}
+
+void OpenFullLog() {
+    std::wstring response;
+    if (!SendCommand(L"LOG|500", response)) {
         return;
     }
     if (response.rfind(L"ERR|", 0) == 0) {
@@ -111,8 +250,8 @@ void ShowLog() {
     GetTempPathW(_countof(tempPath), tempPath);
     const std::wstring logFile = std::wstring(tempPath) + L"GuardDog_日志快照.txt";
 
-    const std::wstring content = L"GuardDog 日志快照（由托盘 UI 拉取）\r\n\r\n" +
-                                 StripStatusPrefix(response);
+    const std::wstring content =
+        L"GuardDog 日志快照（由前端拉取）\r\n\r\n" + StripStatusPrefix(response);
     HANDLE file = CreateFileW(logFile.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
                               FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file == INVALID_HANDLE_VALUE) {
@@ -131,21 +270,6 @@ void ShowLog() {
     ShellExecuteW(nullptr, L"open", L"notepad.exe", logFile.c_str(), nullptr, SW_SHOWNORMAL);
 }
 
-void OpenConfig() {
-    const std::wstring configPath =
-        std::wstring(GuardDog::Constants::kProgramDataDir) + L"\\" +
-        GuardDog::Constants::kConfigFileName;
-
-    if (GetFileAttributesW(configPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
-        ShowInfo(L"配置文件尚不存在：\n" + configPath +
-                     L"\n\n请先启动一次 GuardDog 服务，它会自动生成默认配置。",
-                 MB_OK | MB_ICONWARNING);
-        return;
-    }
-
-    ShellExecuteW(nullptr, L"open", L"notepad.exe", configPath.c_str(), nullptr, SW_SHOWNORMAL);
-}
-
 void RunScan() {
     SetCursor(LoadCursorW(nullptr, IDC_WAIT));
     std::wstring response;
@@ -156,6 +280,17 @@ void RunScan() {
     SetCursor(LoadCursorW(nullptr, IDC_ARROW));
 }
 
+void OpenConfig() {
+    const std::wstring path = ConfigPath();
+    if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        ShowInfo(L"配置文件尚不存在：\n" + path +
+                     L"\n\n请先启动一次 GuardDog 服务，它会自动生成默认配置。",
+                 MB_OK | MB_ICONWARNING);
+        return;
+    }
+    ShellExecuteW(nullptr, L"open", L"notepad.exe", path.c_str(), nullptr, SW_SHOWNORMAL);
+}
+
 void AllowLastTarget() {
     std::wstring response;
     if (SendCommand(L"ALLOW_LAST", response)) {
@@ -164,17 +299,16 @@ void AllowLastTarget() {
 }
 
 void ShowWatchdogStatus() {
-    // 看门狗是独立服务，直接查服务状态即可，不必绕道主服务
     std::wstring text;
+
     SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
     if (scm == nullptr) {
-        ShowInfo(L"无法打开服务控制管理器（需要管理员权限才能查询服务）。",
-                 MB_OK | MB_ICONWARNING);
+        ShowInfo(L"无法打开服务控制管理器（查询服务需要管理员权限）。", MB_OK | MB_ICONWARNING);
         return;
     }
 
-    SC_HANDLE service = OpenServiceW(scm, GuardDog::Constants::kWatchdogServiceName,
-                                     SERVICE_QUERY_STATUS);
+    SC_HANDLE service =
+        OpenServiceW(scm, GuardDog::Constants::kWatchdogServiceName, SERVICE_QUERY_STATUS);
     if (service == nullptr) {
         text = L"看门狗服务未安装。\n\n安装命令（管理员）：\n    GuardDogWatchdog.exe install";
     } else {
@@ -201,14 +335,32 @@ void ShowWatchdogStatus() {
 }
 
 void ShowAbout() {
+    const std::wstring mode = ReadStartupMode();
     ShowInfo(std::wstring(L"GuardDog ") + GuardDog::Constants::kVersion + L"\n" +
-                 GuardDog::Constants::kBuildStage +
-                 L"\n\n纯用户态防流氓软件防护工具。\n"
-                 L"服务端负责监控与清理，本托盘程序仅用于查看状态。\n\n"
-                 L"退出本程序不会停止防护服务。");
+             GuardDog::Constants::kBuildStage +
+             L"\n\n纯用户态防流氓软件防护工具。\n"
+             L"服务端负责监控与清理，本界面仅用于查看状态。\n\n"
+             L"当前启动模式：" + mode + L"（在配置文件的 startup_mode 中修改）\n"
+             L"关闭窗口只是隐藏到托盘，退出程序也不会停止防护服务。");
 }
 
-void ShowTrayMenu() {
+void ShowMainWindow() {
+    if (g_mainWindow == nullptr) {
+        return;
+    }
+    ShowWindow(g_mainWindow, SW_SHOWNORMAL);
+    SetForegroundWindow(g_mainWindow);
+    RefreshStatus();
+    RefreshLog();
+}
+
+void HideMainWindow() {
+    if (g_mainWindow != nullptr) {
+        ShowWindow(g_mainWindow, SW_HIDE);
+    }
+}
+
+void ShowTrayMenu(HWND window) {
     POINT cursor{};
     GetCursorPos(&cursor);
 
@@ -217,50 +369,94 @@ void ShowTrayMenu() {
         return;
     }
 
-    AppendMenuW(menu, MF_STRING, kMenuStatus, L"查看状态");
-    AppendMenuW(menu, MF_STRING, kMenuLog, L"查看日志");
+    AppendMenuW(menu, MF_STRING, kIdRefresh, L"显示主窗口");
+    AppendMenuW(menu, MF_STRING, kIdFullLog, L"查看日志");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING, kMenuScan, L"手动扫描（只读）");
-    AppendMenuW(menu, MF_STRING, kMenuAllowLast, L"临时放行最近处置的目标");
-    AppendMenuW(menu, MF_STRING, kMenuWatchdog, L"看门狗状态");
+    AppendMenuW(menu, MF_STRING, kIdScan, L"手动扫描（只读）");
+    AppendMenuW(menu, MF_STRING, kIdAllowLast, L"临时放行最近处置的目标");
+    AppendMenuW(menu, MF_STRING, kIdWatchdog, L"看门狗状态");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING, kMenuConfig, L"打开配置文件");
-    AppendMenuW(menu, MF_STRING, kMenuAbout, L"关于");
+    AppendMenuW(menu, MF_STRING, kIdConfig, L"打开配置文件");
+    AppendMenuW(menu, MF_STRING, kIdAbout, L"关于");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING, kMenuExit, L"退出（不影响防护）");
+    AppendMenuW(menu, MF_STRING, kIdExit, L"退出（不影响防护）");
 
     // TrackPopupMenu 要求先让本窗口成为前台窗口，否则点击菜单外部不会消失
-    SetForegroundWindow(g_window);
+    SetForegroundWindow(window);
 
     const UINT command = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, cursor.x, cursor.y, 0,
-                                        g_window, nullptr);
+                                        window, nullptr);
     DestroyMenu(menu);
 
+    if (command == 0) {
+        return;
+    }
+
     switch (command) {
-        case kMenuStatus:    ShowStatus(); break;
-        case kMenuLog:       ShowLog(); break;
-        case kMenuScan:      RunScan(); break;
-        case kMenuAllowLast: AllowLastTarget(); break;
-        case kMenuWatchdog:  ShowWatchdogStatus(); break;
-        case kMenuConfig:    OpenConfig(); break;
-        case kMenuAbout:     ShowAbout(); break;
-        case kMenuExit:      DestroyWindow(g_window); break;
+        case kIdRefresh:    ShowMainWindow(); break;
+        case kIdFullLog:    OpenFullLog(); break;
+        case kIdScan:       RunScan(); break;
+        case kIdAllowLast:  AllowLastTarget(); break;
+        case kIdWatchdog:   ShowWatchdogStatus(); break;
+        case kIdConfig:     OpenConfig(); break;
+        case kIdAbout:      ShowAbout(); break;
+        case kIdHide:       HideMainWindow(); break;
+        case kIdExit:       DestroyWindow(window); break;
         default: break;
     }
 }
 
-LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+void HandleCommand(int id) {
+    switch (id) {
+        case kIdRefresh:    RefreshStatus(); RefreshLog(); break;
+        case kIdFullLog:    OpenFullLog(); break;
+        case kIdScan:       RunScan(); break;
+        case kIdConfig:     OpenConfig(); break;
+        case kIdAllowLast:  AllowLastTarget(); break;
+        case kIdWatchdog:   ShowWatchdogStatus(); break;
+        case kIdHide:       HideMainWindow(); break;
+        case kIdExit:       DestroyWindow(g_mainWindow); break;
+        default: break;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 窗口过程
+// ---------------------------------------------------------------------------
+
+LRESULT CALLBACK MainWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
+        case WM_CREATE:
+            CreateControls(window);
+            return 0;
+
+        case WM_SIZE:
+            LayoutControls(window, LOWORD(lParam), HIWORD(lParam));
+            return 0;
+
+        case WM_GETMINMAXINFO: {
+            auto* info = reinterpret_cast<MINMAXINFO*>(lParam);
+            info->ptMinTrackSize.x = kMinWindowWidth;
+            info->ptMinTrackSize.y = kMinWindowHeight;
+            return 0;
+        }
+
+        case WM_COMMAND:
+            HandleCommand(LOWORD(wParam));
+            return 0;
+
         case kTrayCallbackMessage:
-            if (LOWORD(lParam) == WM_RBUTTONUP || LOWORD(lParam) == WM_CONTEXTMENU) {
-                ShowTrayMenu();
-            } else if (LOWORD(lParam) == WM_LBUTTONDBLCLK) {
-                ShowStatus();
+            if (LOWORD(lParam) == WM_LBUTTONDBLCLK) {
+                ShowMainWindow();
+            } else if (LOWORD(lParam) == WM_RBUTTONUP || LOWORD(lParam) == WM_CONTEXTMENU) {
+                ShowTrayMenu(window);
             }
             return 0;
 
-        case WM_COMMAND:
-            // 菜单未使用 TPM_RETURNCMD 时才会走到这里；保留以兼容键盘操作
+        case WM_CLOSE:
+            // 关闭主窗口只隐藏到托盘：用户很容易把"关掉界面"理解成"停了防护"，
+            // 如果这里真的退出进程，反而会让人以为防护没了（其实服务一直独立运行）。
+            HideMainWindow();
             return 0;
 
         case WM_DESTROY:
@@ -272,6 +468,10 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
             return DefWindowProcW(window, message, wParam, lParam);
     }
 }
+
+// ---------------------------------------------------------------------------
+// 登录启动项
+// ---------------------------------------------------------------------------
 
 bool InstallAutoStart() {
     const std::wstring executable = GetSelfPath();
@@ -287,8 +487,7 @@ bool InstallAutoStart() {
 
     const std::wstring command = L"\"" + executable + L"\"";
     const LSTATUS status =
-        RegSetValueExW(key, kRunValueName, 0, REG_SZ,
-                       reinterpret_cast<const BYTE*>(command.c_str()),
+        RegSetValueExW(key, kRunValueName, 0, REG_SZ, reinterpret_cast<const BYTE*>(command.c_str()),
                        static_cast<DWORD>((command.size() + 1) * sizeof(wchar_t)));
     RegCloseKey(key);
     return status == ERROR_SUCCESS;
@@ -304,14 +503,14 @@ bool UninstallAutoStart() {
     return status == ERROR_SUCCESS || status == ERROR_FILE_NOT_FOUND;
 }
 
-void RegisterTrayIcon() {
+void RegisterTrayIcon(HWND window) {
     g_trayData.cbSize = sizeof(g_trayData);
-    g_trayData.hWnd = g_window;
+    g_trayData.hWnd = window;
     g_trayData.uID = kTrayIconId;
     g_trayData.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     g_trayData.uCallbackMessage = kTrayCallbackMessage;
     g_trayData.hIcon = LoadIconW(nullptr, IDI_APPLICATION);  // 用系统图标，避免引入资源文件
-    wcscpy_s(g_trayData.szTip, L"GuardDog 防护中（双击查看状态）");
+    wcscpy_s(g_trayData.szTip, L"GuardDog 防护中（双击显示主窗口）");
 
     Shell_NotifyIconW(NIM_ADD, &g_trayData);
 }
@@ -320,15 +519,13 @@ void RegisterTrayIcon() {
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE /*prevInstance*/, LPWSTR commandLine,
                     int /*showCommand*/) {
-    g_instance = instance;
-
-    // 命令行：install / uninstall 用于把 UI 注册到当前用户的登录启动项
+    // 命令行：install / uninstall 用于把前端注册到当前用户的登录启动项
     const std::wstring command(commandLine != nullptr ? commandLine : L"");
     if (!command.empty()) {
         if (_wcsicmp(command.c_str(), L"install") == 0) {
             const bool ok = InstallAutoStart();
             MessageBoxW(nullptr,
-                        ok ? L"已把 GuardDog 托盘程序加入当前用户的登录启动项。"
+                        ok ? L"已把 GuardDog 前端加入当前用户的登录启动项。"
                            : L"写入登录启动项失败（请检查当前用户权限）。",
                         L"GuardDog", MB_OK | (ok ? MB_ICONINFORMATION : MB_ICONWARNING));
             return ok ? 0 : 1;
@@ -341,24 +538,39 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE /*prevInstance*/, LPWSTR comma
         }
     }
 
+    // 启动模式：配置文件说了算
+    const std::wstring startupMode = ReadStartupMode();
+    g_startedHidden = (_wcsicmp(startupMode.c_str(), L"hidden") == 0);
+
     WNDCLASSEXW windowClass{};
     windowClass.cbSize = sizeof(windowClass);
-    windowClass.lpfnWndProc = WindowProc;
+    windowClass.lpfnWndProc = MainWindowProc;
     windowClass.hInstance = instance;
     windowClass.lpszClassName = kWindowClassName;
+    windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    windowClass.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
 
     if (RegisterClassExW(&windowClass) == 0) {
         return 1;
     }
 
-    // 只创建消息窗口，不显示任何界面；托盘图标才是这个程序的"界面"
-    g_window = CreateWindowExW(0, kWindowClassName, L"GuardDog", 0, 0, 0, 0, 0, nullptr, nullptr,
-                               instance, nullptr);
-    if (g_window == nullptr) {
+    g_mainWindow = CreateWindowExW(0, kWindowClassName, L"GuardDog 防护面板",
+                                   WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, kWindowWidth,
+                                   kWindowHeight, nullptr, nullptr, instance, nullptr);
+    if (g_mainWindow == nullptr) {
         return 1;
     }
 
-    RegisterTrayIcon();
+    // 托盘图标无论哪种模式都要注册：
+    // hidden 模式下它是用户唯一的入口，gui 模式下关闭窗口后也靠它唤回。
+    RegisterTrayIcon(g_mainWindow);
+
+    if (!g_startedHidden) {
+        ShowWindow(g_mainWindow, SW_SHOWNORMAL);
+        UpdateWindow(g_mainWindow);
+        RefreshStatus();
+        RefreshLog();
+    }
 
     MSG message{};
     while (GetMessageW(&message, nullptr, 0, 0) > 0) {

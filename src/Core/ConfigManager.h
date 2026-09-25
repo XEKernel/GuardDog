@@ -44,6 +44,10 @@ struct Settings {
     // 默认关闭：开启后如果黑名单规则写得过宽（例如只写了进程名而目标恰好与
     // 自己的其他工具同目录），会连带清除同目录的正常程序。开启前请确认目录归属。
     bool removeWholeDirectory = false;
+    // 前端启动模式（GuardDogUI 启动时读取）：
+    //   gui    —— 显示主窗口（默认）
+    //   hidden —— 纯隐藏：不显示任何窗口，仅驻留托盘图标，双击/右键唤出
+    std::wstring startupMode = L"gui";
     std::wstring logLevel = L"info";    // debug / info / warn / error
 };
 

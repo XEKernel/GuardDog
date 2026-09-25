@@ -52,6 +52,7 @@
     "clean_wmi_subscriptions": true,
     "clean_legacy_on_start": false,
     "remove_whole_directory": false,
+    "startup_mode": "gui",
     "log_level": "info"
   }
 }
