@@ -242,11 +242,32 @@ DestroyResult FileDestroyer::DestroyFile(const Config& config, const std::wstrin
 
     // ---- F2 解除占用后删除 ----
     // 用 Restart Manager 找出占用者，先挂起再终止，然后重试删除。
-    // 目标进程此时可能已被处置流程终止，但守护进程/索引器/杀软扫描线程仍可能持有句柄。
+    //
+    // 安全边界：只终止"本身就是黑名单目标"的占用者。
+    // 文件被占用是很常见的现象——杀毒软件扫描、explorer 预览、索引服务都可能短时持有句柄。
+    // 无差别终止占用者会把系统拖垮（杀掉 explorer 等于桌面重启），
+    // 这类情况宁可走 F3：毁掉 PE 头 + 登记重启删除，同样能让目标永久报废。
     const std::vector<DWORD> lockers = FindProcessesLockingFile(path);
     if (!lockers.empty()) {
-        std::wstring lockerText;
+        std::vector<DWORD> terminable;
         for (const DWORD processId : lockers) {
+            const std::wstring ownerPath = ProcessKiller::QueryImagePath(processId);
+            if (ownerPath.empty()) {
+                GD_LOG_WARN(L"[文件处置] 无法确定占用进程的映像路径，跳过终止：pid=%lu", processId);
+                continue;
+            }
+
+            if (!Matcher::IsInBlacklist(config, ownerPath)) {
+                GD_LOG_WARN(L"[文件处置] 占用进程未命中黑名单，跳过终止以免误伤：pid=%lu 路径=%s",
+                            processId, ownerPath.c_str());
+                continue;
+            }
+
+            terminable.push_back(processId);
+        }
+
+        std::wstring lockerText;
+        for (const DWORD processId : terminable) {
             const std::wstring ownerPath = ProcessKiller::QueryImagePath(processId);
             if (!lockerText.empty()) {
                 lockerText += L", ";
@@ -261,16 +282,19 @@ DestroyResult FileDestroyer::DestroyFile(const Config& config, const std::wstrin
                 ProcessKiller::ForceKillWithTaskkill(processId);
             }
         }
-        GD_LOG_WARN(L"[文件处置] 已终止占用进程：%s（%s）", path.c_str(), lockerText.c_str());
 
-        // 等文件句柄真正释放
-        for (int attempt = 0; attempt < 10; ++attempt) {
-            Sleep(200);
-            if (TryDeleteDirect(path)) {
-                GD_LOG_WARN(L"[文件处置] 解除占用后删除成功：%s", path.c_str());
-                result.outcome = DestroyOutcome::Deleted;
-                result.detail = L"终止占用进程后删除";
-                return result;
+        if (!terminable.empty()) {
+            GD_LOG_WARN(L"[文件处置] 已终止占用进程：%s（%s）", path.c_str(), lockerText.c_str());
+
+            // 等文件句柄真正释放
+            for (int attempt = 0; attempt < 10; ++attempt) {
+                Sleep(200);
+                if (TryDeleteDirect(path)) {
+                    GD_LOG_WARN(L"[文件处置] 解除占用后删除成功：%s", path.c_str());
+                    result.outcome = DestroyOutcome::Deleted;
+                    result.detail = L"终止占用进程后删除";
+                    return result;
+                }
             }
         }
     }

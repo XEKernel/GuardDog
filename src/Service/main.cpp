@@ -261,6 +261,13 @@ void LoadConfigOrReport() {
     const auto config = ConfigManager::Instance().GetSnapshot();
     if (config) {
         GD_LOG_INFO(L"配置来源：%s", config->sourcePath.c_str());
+
+        // 关于复活观察期：GuardDog 的监控是常态化的（WMI 事件 + 每 500ms 全量扫描），
+        // 处置后目标若被拉起会立刻再次命中并入队处置，因此无需单独的"观察期"计时器。
+        // 这里显式说明，避免用户以为 observe_after_kill_seconds 是个没生效的开关。
+        GD_LOG_INFO(L"复活对抗方式：常态化监控（配置中的 observe_after_kill_seconds=%d 秒用于标注策略意图，"
+                    L"实际由持续监控承担）",
+                    config->settings.observeSeconds);
     }
 }
 

@@ -137,6 +137,13 @@ bool ScriptMentionsTarget(const std::wstring& scriptText, const std::wstring& ta
 CleanResult CleanWmiSubscriptions(const Config& config, const AutoStartTarget& target, bool clean) {
     CleanResult result;
 
+    // 配置开关必须真正生效：否则用户以为关掉了 WMI 订阅清理，
+    // 实际每次处置仍在动 root\subscription——这种"假开关"比不提供开关更糟。
+    if (!config.settings.cleanWmiSubscriptions) {
+        GD_LOG_INFO(L"配置已停用 WMI 永久事件订阅清理，跳过");
+        return result;
+    }
+
     ScopedCom com;
     if (!com.IsUsable()) {
         GD_LOG_WARN(L"COM 不可用，跳过 WMI 永久事件订阅检查");
