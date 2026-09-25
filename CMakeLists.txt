@@ -103,6 +103,18 @@ add_executable(GuardDogService WIN32
 target_link_libraries(GuardDogService PRIVATE GuardDogCore)
 set_target_properties(GuardDogService PROPERTIES LINK_FLAGS "/ENTRY:wmainCRTStartup")
 
+# ---------------------------------------------------------------------------
+# GuardDogWatchdog：看门狗服务
+# 独立进程：职责单一（定期确认主服务在运行，不在则拉起）。
+# 与主服务分开的原因：主服务被干掉时，进程内的看门狗也会一起消失。
+# ---------------------------------------------------------------------------
+add_executable(GuardDogWatchdog WIN32
+    src/Service/Watchdog.cpp
+    src/Service/ServiceInstaller.cpp
+)
+
+target_link_libraries(GuardDogWatchdog PRIVATE GuardDogCore)
+set_target_properties(GuardDogWatchdog PROPERTIES LINK_FLAGS "/ENTRY:wmainCRTStartup")
+
 # 后续批次目标（占位说明，勿删）：
-#   GuardDogWatchdog.exe —— 批次 6 看门狗
-#   GuardDogUI.exe       —— 批次 6 之后托盘 UI
+#   GuardDogUI.exe —— 阶段三托盘 UI

@@ -26,6 +26,7 @@
 #include "Core/Constants.h"
 #include "Core/Logger.h"
 #include "Core/Matcher.h"
+#include "Core/ScopeHandle.h"
 #include "Monitor/ProcessKiller.h"
 #include "Monitor/ProcessPoller.h"
 #include "Monitor/WmiMonitor.h"
@@ -45,6 +46,7 @@ using GuardDog::MatchResult;
 using GuardDog::Matcher;
 using GuardDog::ProcessKiller;
 using GuardDog::ProcessPoller;
+using GuardDog::ScopeHandle;
 using GuardDog::WmiMonitor;
 
 SERVICE_STATUS_HANDLE g_statusHandle = nullptr;
@@ -63,6 +65,50 @@ constexpr DWORD kWorkerWaitOnStopMs = 30000;
 constexpr DWORD kMainLoopIntervalMs = 200;           // 主循环节拍，同时决定停止命令的响应延迟
 constexpr ULONGLONG kConfigCheckIntervalMs = 1000;   // 配置热重载检查周期
 constexpr ULONGLONG kWmiReconnectIntervalMs = 30000; // WMI 订阅重建的最小重试间隔
+constexpr ULONGLONG kWatchdogCheckIntervalMs = 60000;  // 反向守望看门狗的检查周期
+
+void CloseServiceHandleCompat(HANDLE handle) {
+    CloseServiceHandle(reinterpret_cast<SC_HANDLE>(handle));
+}
+
+// 反向守望：主服务也定期确认看门狗服务在运行。
+// 只有看门狗守主服务是不够的——看门狗自己被停掉（或崩溃）之后就没有人恢复它，
+// 两侧互相检查才能避免单点失效。
+void EnsureWatchdogRunning() {
+    ScopeHandle scm;
+    scm.Reset(OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT), CloseServiceHandleCompat);
+    if (!scm.IsValid()) {
+        return;
+    }
+
+    ScopeHandle service;
+    service.Reset(OpenServiceW(reinterpret_cast<SC_HANDLE>(scm.Get()),
+                               GuardDog::Constants::kWatchdogServiceName,
+                               SERVICE_QUERY_STATUS | SERVICE_START),
+                  CloseServiceHandleCompat);
+    if (!service.IsValid()) {
+        // 没装看门狗属于正常部署形态，只提示不报错
+        GD_LOG_DEBUG(L"看门狗服务不存在或无法打开（错误 %lu）", GetLastError());
+        return;
+    }
+
+    SERVICE_STATUS status{};
+    if (!QueryServiceStatus(reinterpret_cast<SC_HANDLE>(service.Get()), &status)) {
+        return;
+    }
+    if (status.dwCurrentState == SERVICE_RUNNING ||
+        status.dwCurrentState == SERVICE_START_PENDING) {
+        return;
+    }
+
+    GD_LOG_WARN(L"检测到看门狗服务未运行（状态 %lu），尝试拉起", status.dwCurrentState);
+    if (!StartServiceW(reinterpret_cast<SC_HANDLE>(service.Get()), 0, nullptr)) {
+        const DWORD error = GetLastError();
+        if (error != ERROR_SERVICE_ALREADY_RUNNING) {
+            GD_LOG_ERROR(L"拉起看门狗服务失败（错误 %lu）", error);
+        }
+    }
+}
 
 std::wstring ToLower(const std::wstring& text) {
     std::wstring result = text;
@@ -371,6 +417,7 @@ DWORD WINAPI WorkerThread(LPVOID /*param*/) {
 
     ULONGLONG lastConfigCheck = GetTickCount64();
     ULONGLONG lastWmiReconnectAttempt = GetTickCount64();
+    ULONGLONG lastWatchdogCheck = GetTickCount64();
 
     for (;;) {
         const DWORD waitResult = WaitForSingleObject(g_stopEvent, kMainLoopIntervalMs);
@@ -423,7 +470,13 @@ DWORD WINAPI WorkerThread(LPVOID /*param*/) {
             wmiMonitor.Stop();
         }
 
-        // 4) 串行处置（放在最后，确保本轮的所有发现路径都已执行过）
+        // 4) 反向守望：确认看门狗服务还在运行（互相守护，避免单点失效）
+        if ((now - lastWatchdogCheck) >= kWatchdogCheckIntervalMs) {
+            lastWatchdogCheck = now;
+            EnsureWatchdogRunning();
+        }
+
+        // 5) 串行处置（放在最后，确保本轮的所有发现路径都已执行过）
         HandlePendingThreats();
     }
 
@@ -602,12 +655,12 @@ int wmain(int argc, wchar_t* argv[]) {
 
     if (command == L"install") {
         EnsureConsoleSink();
-        return GuardDog::ServiceInstaller::Install();
+        return GuardDog::ServiceInstaller::Install(GuardDog::MainServiceDefinition());
     }
 
     if (command == L"uninstall") {
         EnsureConsoleSink();
-        return GuardDog::ServiceInstaller::Uninstall();
+        return GuardDog::ServiceInstaller::Uninstall(GuardDog::MainServiceDefinition());
     }
 
     if (command == L"console") {

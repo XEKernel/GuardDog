@@ -8,8 +8,8 @@ namespace GuardDog {
 namespace Constants {
 
 // ---- 版本 ----
-inline constexpr wchar_t kVersion[]  = L"0.4.0";
-inline constexpr wchar_t kBuildStage[] = L"批次4-自启动清理（断根）";
+inline constexpr wchar_t kVersion[]  = L"1.0.0";
+inline constexpr wchar_t kBuildStage[] = L"批次6-看门狗与集成测试（全部批次完成）";
 
 // ---- 主服务标识 ----
 inline constexpr wchar_t kServiceName[]        = L"GuardDogService";
@@ -20,6 +20,8 @@ inline constexpr wchar_t kServiceDescription[] =
 // ---- 看门狗服务标识（批次 6 使用）----
 inline constexpr wchar_t kWatchdogServiceName[]  = L"GuardDogWatchdog";
 inline constexpr wchar_t kWatchdogDisplayName[]  = L"GuardDog 看门狗";
+inline constexpr wchar_t kWatchdogDescription[] =
+    L"GuardDog 看门狗：定期检查主防护服务是否在运行，异常退出时自动将其拉起。";
 
 // ---- 数据目录 ----
 // 固定使用 ProgramData：LocalSystem 服务与各登录用户都能访问，

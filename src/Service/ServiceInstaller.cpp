@@ -106,12 +106,12 @@ bool ServiceInstaller::IsElevated() {
     return elevation.TokenIsElevated != 0;
 }
 
-int ServiceInstaller::Install() {
+int ServiceInstaller::Install(const ServiceDefinition& definition) {
     // 安装阶段日志目录可能还不存在，初始化失败不阻断安装
     (void)Logger::Instance().Initialize();
-    GD_LOG_INFO(L"开始安装服务：%s", Constants::kServiceName);
+    GD_LOG_INFO(L"开始安装服务：%s", definition.name);
 
-    PrintLine(L"[GuardDog] 正在安装服务 %s ...", Constants::kServiceName);
+    PrintLine(L"[GuardDog] 正在安装服务 %s ...", definition.name);
 
     if (!IsElevated()) {
         PrintLine(L"[失败] 需要管理员权限。请以管理员身份打开终端后重试。");
@@ -133,12 +133,12 @@ int ServiceInstaller::Install() {
     {
         ScopeHandle existing;
         existing.Reset(
-            OpenServiceW(reinterpret_cast<SC_HANDLE>(scm.Get()), Constants::kServiceName,
+            OpenServiceW(reinterpret_cast<SC_HANDLE>(scm.Get()), definition.name,
                          SERVICE_ALL_ACCESS),
             CloseServiceHandleCompat);
         if (existing.IsValid()) {
             PrintLine(L"[失败] 服务已存在。如需重装，请先执行：GuardDogService.exe uninstall");
-            GD_LOG_WARN(L"安装中止：服务 %s 已存在", Constants::kServiceName);
+            GD_LOG_WARN(L"安装中止：服务 %s 已存在", definition.name);
             return kInstallerExists;
         }
         const DWORD queryError = GetLastError();
@@ -162,10 +162,11 @@ int ServiceInstaller::Install() {
 
     ScopeHandle service;
     service.Reset(
-        CreateServiceW(reinterpret_cast<SC_HANDLE>(scm.Get()), Constants::kServiceName,
-                       Constants::kServiceDisplayName, SERVICE_ALL_ACCESS, SERVICE_WIN32_OWN_PROCESS,
-                       SERVICE_AUTO_START, SERVICE_ERROR_NORMAL, binaryPath.c_str(), nullptr, nullptr,
-                       nullptr, nullptr, nullptr),
+        CreateServiceW(reinterpret_cast<SC_HANDLE>(scm.Get()), definition.name,
+                       definition.displayName, SERVICE_ALL_ACCESS, SERVICE_WIN32_OWN_PROCESS,
+                       definition.autoStart ? SERVICE_AUTO_START : SERVICE_DEMAND_START,
+                       SERVICE_ERROR_NORMAL, binaryPath.c_str(), nullptr, nullptr, nullptr, nullptr,
+                       nullptr),
         CloseServiceHandleCompat);
     if (!service.IsValid()) {
         const DWORD error = GetLastError();
@@ -176,41 +177,43 @@ int ServiceInstaller::Install() {
 
     // 服务描述（sc description 的编程等价物）
     SERVICE_DESCRIPTIONW description{};
-    description.lpDescription = const_cast<LPWSTR>(Constants::kServiceDescription);
+    description.lpDescription = const_cast<LPWSTR>(definition.description);
     if (!ChangeServiceConfig2W(reinterpret_cast<SC_HANDLE>(service.Get()),
                                SERVICE_CONFIG_DESCRIPTION, &description)) {
         GD_LOG_WARN(L"设置服务描述失败：%lu", GetLastError());
     }
 
-    // 恢复策略：等价于 sc failure GuardDogService reset= 0
+    // 恢复策略：等价于 sc failure <name> reset= 0
     //          actions= restart/5000/restart/5000/restart/5000
     // reset= 0 在 API 侧对应 dwResetPeriod = INFINITE（失败计数永不重置）
-    SC_ACTION actions[3] = {
-        {SC_ACTION_RESTART, 5000},
-        {SC_ACTION_RESTART, 5000},
-        {SC_ACTION_RESTART, 5000},
-    };
-    SERVICE_FAILURE_ACTIONSW failureActions{};
-    failureActions.dwResetPeriod = INFINITE;
-    failureActions.lpRebootMsg   = nullptr;
-    failureActions.lpCommand     = nullptr;
-    failureActions.cActions      = static_cast<DWORD>(sizeof(actions) / sizeof(actions[0]));
-    failureActions.lpsaActions   = actions;
+    if (definition.withFailureActions) {
+        SC_ACTION actions[3] = {
+            {SC_ACTION_RESTART, 5000},
+            {SC_ACTION_RESTART, 5000},
+            {SC_ACTION_RESTART, 5000},
+        };
+        SERVICE_FAILURE_ACTIONSW failureActions{};
+        failureActions.dwResetPeriod = INFINITE;
+        failureActions.lpRebootMsg   = nullptr;
+        failureActions.lpCommand     = nullptr;
+        failureActions.cActions      = static_cast<DWORD>(sizeof(actions) / sizeof(actions[0]));
+        failureActions.lpsaActions   = actions;
 
-    if (!ChangeServiceConfig2W(reinterpret_cast<SC_HANDLE>(service.Get()),
-                               SERVICE_CONFIG_FAILURE_ACTIONS, &failureActions)) {
-        // 不致命：服务仍可手动启动，恢复策略可事后用 sc failure 补设
-        const DWORD error = GetLastError();
-        PrintLine(L"[警告] 设置服务恢复策略失败：%lu (%s)", error, FormatWin32Error(error).c_str());
-        GD_LOG_WARN(L"设置恢复策略失败：%lu", error);
-    } else {
-        GD_LOG_INFO(L"已设置恢复策略：失败后 5 秒重启，最多重试 3 次");
+        if (!ChangeServiceConfig2W(reinterpret_cast<SC_HANDLE>(service.Get()),
+                                   SERVICE_CONFIG_FAILURE_ACTIONS, &failureActions)) {
+            // 不致命：服务仍可手动启动，恢复策略可事后用 sc failure 补设
+            const DWORD error = GetLastError();
+            PrintLine(L"[警告] 设置服务恢复策略失败：%lu (%s)", error, FormatWin32Error(error).c_str());
+            GD_LOG_WARN(L"设置恢复策略失败：%lu", error);
+        } else {
+            GD_LOG_INFO(L"已设置恢复策略：失败后 5 秒重启，最多重试 3 次");
+        }
     }
 
     PrintLine(L"[成功] 服务已注册：");
-    PrintLine(L"        服务名  ：%s", Constants::kServiceName);
-    PrintLine(L"        显示名  ：%s", Constants::kServiceDisplayName);
-    PrintLine(L"        启动类型：自动");
+    PrintLine(L"        服务名  ：%s", definition.name);
+    PrintLine(L"        显示名  ：%s", definition.displayName);
+    PrintLine(L"        启动类型：%s", definition.autoStart ? L"自动" : L"手动");
     PrintLine(L"        运行账户：LocalSystem");
     PrintLine(L"        可执行  ：%s", executablePath.c_str());
 
@@ -221,7 +224,7 @@ int ServiceInstaller::Install() {
         } else {
             PrintLine(L"[警告] 服务已注册，但自动启动失败：%lu (%s)", error,
                       FormatWin32Error(error).c_str());
-            PrintLine(L"        可稍后手动启动：sc start %s", Constants::kServiceName);
+            PrintLine(L"        可稍后手动启动：sc start %s", definition.name);
             GD_LOG_WARN(L"StartService 失败：%lu", error);
         }
         GD_LOG_INFO(L"服务安装完成（未自动启动）");
@@ -240,11 +243,11 @@ int ServiceInstaller::Install() {
     return kInstallerOk;
 }
 
-int ServiceInstaller::Uninstall() {
+int ServiceInstaller::Uninstall(const ServiceDefinition& definition) {
     (void)Logger::Instance().Initialize();
-    GD_LOG_INFO(L"开始卸载服务：%s", Constants::kServiceName);
+    GD_LOG_INFO(L"开始卸载服务：%s", definition.name);
 
-    PrintLine(L"[GuardDog] 正在卸载服务 %s ...", Constants::kServiceName);
+    PrintLine(L"[GuardDog] 正在卸载服务 %s ...", definition.name);
 
     if (!IsElevated()) {
         PrintLine(L"[失败] 需要管理员权限。请以管理员身份打开终端后重试。");
@@ -262,7 +265,7 @@ int ServiceInstaller::Uninstall() {
     }
 
     ScopeHandle service;
-    service.Reset(OpenServiceW(reinterpret_cast<SC_HANDLE>(scm.Get()), Constants::kServiceName,
+    service.Reset(OpenServiceW(reinterpret_cast<SC_HANDLE>(scm.Get()), definition.name,
                                SERVICE_STOP | SERVICE_QUERY_STATUS | DELETE),
                   CloseServiceHandleCompat);
     if (!service.IsValid()) {
@@ -321,6 +324,28 @@ int ServiceInstaller::Uninstall() {
               Constants::kProgramDataDir);
     GD_LOG_INFO(L"服务卸载完成");
     return kInstallerOk;
+}
+
+const ServiceDefinition& MainServiceDefinition() {
+    static const ServiceDefinition definition{
+        Constants::kServiceName,
+        Constants::kServiceDisplayName,
+        Constants::kServiceDescription,
+        true,   // 自动启动
+        true,   // 设置失败重启策略
+    };
+    return definition;
+}
+
+const ServiceDefinition& WatchdogServiceDefinition() {
+    static const ServiceDefinition definition{
+        Constants::kWatchdogServiceName,
+        Constants::kWatchdogDisplayName,
+        Constants::kWatchdogDescription,
+        true,    // 自动启动：看门狗必须在开机时就位，否则主服务没人守
+        false,   // 看门狗自身不设失败重启策略：它的存活由主服务侧的检查兜底
+    };
+    return definition;
 }
 
 } // namespace GuardDog
