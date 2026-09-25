@@ -74,6 +74,7 @@ add_library(GuardDogCore STATIC
     src/AutoStart/WinlogonCleaner.cpp
     src/Cleaner/FileDestroyer.cpp
     src/Cleaner/LegacyScanner.cpp
+    src/Core/IPC.cpp
 )
 
 target_include_directories(GuardDogCore PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -116,5 +117,14 @@ add_executable(GuardDogWatchdog WIN32
 target_link_libraries(GuardDogWatchdog PRIVATE GuardDogCore)
 set_target_properties(GuardDogWatchdog PROPERTIES LINK_FLAGS "/ENTRY:wmainCRTStartup")
 
-# 后续批次目标（占位说明，勿删）：
-#   GuardDogUI.exe —— 阶段三托盘 UI
+# ---------------------------------------------------------------------------
+# GuardDogUI：托盘 UI（阶段三）
+# 普通用户权限即可运行；通过命名管道查询状态，
+# 刻意不提供删除/终止类命令——UI 的权限模型不同于服务，暴露危险动作等于开提权后门。
+# ---------------------------------------------------------------------------
+add_executable(GuardDogUI WIN32
+    src/UI/TrayApp.cpp
+)
+
+target_link_libraries(GuardDogUI PRIVATE GuardDogCore)
+set_target_properties(GuardDogUI PROPERTIES LINK_FLAGS "/ENTRY:wWinMainCRTStartup")

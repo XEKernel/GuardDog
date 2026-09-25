@@ -20,10 +20,12 @@
 #include <mutex>
 #include <string>
 
+#include "AutoStart/AutoStartTypes.h"
 #include "Cleaner/FileDestroyer.h"
 #include "Cleaner/LegacyScanner.h"
 #include "Core/ConfigManager.h"
 #include "Core/Constants.h"
+#include "Core/IPC.h"
 #include "Core/Logger.h"
 #include "Core/Matcher.h"
 #include "Core/ScopeHandle.h"
@@ -32,12 +34,16 @@
 #include "Monitor/WmiMonitor.h"
 #include "Service/ServiceInstaller.h"
 
+#include <fstream>
+#include <vector>
+
 namespace {
 
 using GuardDog::ConfigManager;
 using GuardDog::Constants::kServiceName;
 using GuardDog::DestroyResult;
 using GuardDog::FileDestroyer;
+using GuardDog::IpcServer;
 using GuardDog::LegacyScanner;
 using GuardDog::LegacyScanResult;
 using GuardDog::Logger;
@@ -46,6 +52,7 @@ using GuardDog::MatchResult;
 using GuardDog::Matcher;
 using GuardDog::ProcessKiller;
 using GuardDog::ProcessPoller;
+using GuardDog::ReadTextFileWide;
 using GuardDog::ScopeHandle;
 using GuardDog::WmiMonitor;
 
@@ -272,6 +279,144 @@ void LoadConfigOrReport() {
 }
 
 // ---------------------------------------------------------------------------
+// 运行时状态与 IPC 命令处理（供托盘 UI 查询）
+//
+// 这些状态只服务于"让用户看得见"，不参与任何判定逻辑，
+// 因此单独放在一处、用一把锁保护，避免把监控循环的状态机搅复杂。
+// ---------------------------------------------------------------------------
+std::atomic<unsigned long long> g_handledCount{0};
+std::mutex g_runtimeStateMutex;
+std::wstring g_lastHandledPath;
+std::wstring g_lastHandledTime;
+std::vector<std::wstring> g_temporaryAllowList;  // 临时放行（内存态，服务重启后失效）
+
+std::wstring CurrentTimeText() {
+    SYSTEMTIME time{};
+    GetLocalTime(&time);
+    wchar_t buffer[64] = {};
+    swprintf_s(buffer, L"%04d-%02d-%02d %02d:%02d:%02d", time.wYear, time.wMonth, time.wDay,
+               time.wHour, time.wMinute, time.wSecond);
+    return std::wstring(buffer);
+}
+
+void RecordHandledTarget(const std::wstring& imagePath) {
+    std::lock_guard<std::mutex> lock(g_runtimeStateMutex);
+    g_lastHandledPath = imagePath;
+    g_lastHandledTime = CurrentTimeText();
+    g_handledCount.fetch_add(1);
+}
+
+bool IsTemporarilyAllowed(const std::wstring& imagePath) {
+    std::lock_guard<std::mutex> lock(g_runtimeStateMutex);
+    if (g_temporaryAllowList.empty()) {
+        return false;
+    }
+
+    const std::wstring fileName = Matcher::FileNameOf(imagePath);
+    for (const std::wstring& pattern : g_temporaryAllowList) {
+        if (Matcher::WildcardMatch(pattern, fileName) || Matcher::WildcardMatch(pattern, imagePath)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// 读取日志文件尾部若干行（供 UI 展示）
+std::wstring ReadLogTail(int maxLines) {
+    std::wstring content;
+    if (!ReadTextFileWide(Logger::Instance().GetCurrentLogPath(), content) || content.empty()) {
+        return L"(无法读取日志文件)";
+    }
+
+    int lineCount = 0;
+    size_t position = content.size();
+    while (position > 0 && lineCount <= maxLines) {
+        --position;
+        if (content[position] == L'\n') {
+            ++lineCount;
+        }
+    }
+    return content.substr(position);
+}
+
+// IPC 命令处理。
+// 注意：这里只暴露"读状态"与"低风险动作"。刻意不提供"删除/终止"类命令——
+// UI 与服务的权限模型不同（UI 以普通用户运行），把危险动作经管道暴露出去
+// 等于给本机任何进程开了一个提权后门。
+std::wstring HandleIpcCommand(const std::wstring& command,
+                              const std::vector<std::wstring>& arguments) {
+    if (command == L"PING") {
+        return std::wstring(L"OK|GuardDog ") + GuardDog::Constants::kVersion;
+    }
+
+    if (command == L"STATUS") {
+        const auto config = ConfigManager::Instance().GetSnapshot();
+
+        std::lock_guard<std::mutex> lock(g_runtimeStateMutex);
+        wchar_t buffer[768] = {};
+        swprintf_s(buffer,
+                   L"OK|版本=%s\r\n阶段=%s\r\n启用的黑名单规则=%llu\r\n本次运行已处置=%llu 个目标"
+                   L"\r\n最近处置=%s\r\n处置时间=%s\r\n临时放行=%llu 项",
+                   GuardDog::Constants::kVersion, GuardDog::Constants::kBuildStage,
+                   static_cast<unsigned long long>(
+                       config ? ConfigManager::CountEnabledRules(*config) : 0),
+                   g_handledCount.load(),
+                   g_lastHandledPath.empty() ? L"(尚未处置任何目标)" : g_lastHandledPath.c_str(),
+                   g_lastHandledTime.empty() ? L"-" : g_lastHandledTime.c_str(),
+                   static_cast<unsigned long long>(g_temporaryAllowList.size()));
+        return std::wstring(buffer);
+    }
+
+    if (command == L"LOG") {
+        int lines = 100;
+        if (!arguments.empty() && !arguments[0].empty()) {
+            lines = _wtoi(arguments[0].c_str());
+        }
+        if (lines < 1) {
+            lines = 1;
+        }
+        if (lines > 500) {
+            lines = 500;
+        }
+        return L"OK|" + ReadLogTail(lines);
+    }
+
+    if (command == L"SCAN") {
+        const auto config = ConfigManager::Instance().GetSnapshot();
+        if (!config) {
+            return L"ERR|配置不可用";
+        }
+        // 只扫描不处置：一次误点就删掉一批文件是不可接受的
+        const LegacyScanResult result = LegacyScanner::Scan(*config);
+        return L"OK|" + result.Describe();
+    }
+
+    if (command == L"ALLOW_LAST") {
+        std::lock_guard<std::mutex> lock(g_runtimeStateMutex);
+        if (g_lastHandledPath.empty()) {
+            return L"ERR|没有可放行的目标（尚未处置过任何程序）";
+        }
+        const std::wstring name = Matcher::FileNameOf(g_lastHandledPath);
+        g_temporaryAllowList.push_back(name);
+        GD_LOG_WARN(L"IPC：用户临时放行 %s（仅本次运行有效，重启服务后失效）", name.c_str());
+        return L"OK|已临时放行 " + name + L"\r\n（仅在本次服务运行期间有效，重启后恢复拦截）";
+    }
+
+    if (command == L"RELOAD") {
+        std::wstring error;
+        const HRESULT result = ConfigManager::Instance().Load(std::wstring(), &error);
+        if (FAILED(result)) {
+            return L"ERR|重新加载失败：" + error;
+        }
+        ApplyLogLevelFromConfig();
+        Matcher::ClearIdentityCache();
+        return L"OK|配置已重新加载";
+    }
+
+    return L"ERR|未知命令：" + command;
+}
+
+// ---------------------------------------------------------------------------
 // 待处置目标队列
 //
 // WMI 回调跑在 COM 的线程池线程上，轮询跑在主循环线程上。两者只负责"发现并入队"，
@@ -350,7 +495,17 @@ void HandlePendingThreats() {
             continue;
         }
 
+        // 临时放行：用户在托盘菜单里点过"放行最近处置的目标"。
+        // 放在黑名单判定之后，是为了保证"临时放行"不会覆盖白名单语义，
+        // 也不会让一个从未命中的进程混进处置队列后被顺手放过。
+        if (IsTemporarilyAllowed(imagePath)) {
+            GD_LOG_INFO(L"目标在临时放行名单中，跳过处置：pid=%lu 路径=%s", target.processId,
+                        imagePath.c_str());
+            continue;
+        }
+
         ProcessKiller::HandleBlacklistedProcess(target.processId, verdict.Describe());
+        RecordHandledTarget(imagePath);
     }
 }
 
@@ -422,6 +577,12 @@ DWORD WINAPI WorkerThread(LPVOID /*param*/) {
         HandlePendingThreats();
     }
 
+    // 启动 IPC 命令服务，供托盘 UI 查询状态与触发只读扫描。
+    // 失败不阻断监控——UI 只是"看得见"的通道，防护本身不依赖它。
+    if (!IpcServer::Instance().Start(HandleIpcCommand)) {
+        GD_LOG_WARN(L"IPC 命令服务启动失败，托盘 UI 将无法连接（防护功能不受影响）");
+    }
+
     ULONGLONG lastConfigCheck = GetTickCount64();
     ULONGLONG lastWmiReconnectAttempt = GetTickCount64();
     ULONGLONG lastWatchdogCheck = GetTickCount64();
@@ -488,6 +649,7 @@ DWORD WINAPI WorkerThread(LPVOID /*param*/) {
     }
 
     wmiMonitor.Stop();
+    IpcServer::Instance().Stop();
     GD_LOG_INFO(L"工作线程收到停止信号，开始退出");
     return 0;
 }
