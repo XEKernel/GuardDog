@@ -34,6 +34,15 @@ struct DestroyResult {
     std::wstring Describe() const;
 };
 
+// 处置授权范围。
+// 文件处置不可逆，所以默认只允许处置"自身命中黑名单"的文件；
+// 只有在配置里显式打开了"整套软件处置"（remove_whole_directory）时，
+// 才允许把授权放宽到"目标软件所在的目录树"。
+enum class DisposeScope {
+    BlacklistMatch,  // 仅当文件本身命中黑名单（默认，最严格）
+    SoftwareTree,    // 调用方已确认整棵目录树属于该黑名单软件
+};
+
 // 文件销毁器：三级递进策略。
 //
 // F1 直接删除 → F2 解除占用后删除 → F3 登记重启删除 + 覆写 PE 头
@@ -43,8 +52,9 @@ struct DestroyResult {
 // "不是有效的 Win32 应用程序"，该程序即永久报废——即使文件还留在磁盘上也无害。
 class FileDestroyer {
 public:
-    // 处置一个文件。内部会再次校验黑名单（纵深防御），未命中直接拒绝。
-    static DestroyResult DestroyFile(const Config& config, const std::wstring& path);
+    // 处置一个文件。内部会再次校验授权范围（纵深防御），未授权直接拒绝。
+    static DestroyResult DestroyFile(const Config& config, const std::wstring& path,
+                                     DisposeScope scope = DisposeScope::BlacklistMatch);
 
     // 只覆写 PE 头（不删除文件）。用于"文件还需保留但必须废掉"的场景。
     static bool OverwritePeHeader(const std::wstring& path);

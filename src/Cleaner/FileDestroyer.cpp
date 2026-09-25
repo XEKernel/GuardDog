@@ -206,7 +206,8 @@ bool FileDestroyer::OverwritePeHeader(const std::wstring& path) {
     return false;
 }
 
-DestroyResult FileDestroyer::DestroyFile(const Config& config, const std::wstring& path) {
+DestroyResult FileDestroyer::DestroyFile(const Config& config, const std::wstring& path,
+                                         DisposeScope scope) {
     DestroyResult result;
     result.path = path;
 
@@ -218,8 +219,16 @@ DestroyResult FileDestroyer::DestroyFile(const Config& config, const std::wstrin
 
     // 纵深防御：即便调用方已经校验过，这里再校验一次。
     // 文件处置是不可逆操作，"多校验一次"的成本远低于误删用户文件。
-    if (!Matcher::IsInBlacklist(config, path)) {
-        GD_LOG_ERROR(L"拒绝处置未命中黑名单的文件：%s", path.c_str());
+    bool authorized = Matcher::IsInBlacklist(config, path);
+
+    // 目录树授权仍然要求配置显式开启：避免调用方只是误传了一个 scope 参数
+    // 就把整个目录的文件都清掉。
+    if (!authorized && scope == DisposeScope::SoftwareTree) {
+        authorized = config.settings.removeWholeDirectory;
+    }
+
+    if (!authorized) {
+        GD_LOG_ERROR(L"拒绝处置未授权文件：%s", path.c_str());
         result.outcome = DestroyOutcome::Rejected;
         return result;
     }

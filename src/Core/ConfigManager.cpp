@@ -70,6 +70,7 @@ constexpr char kDefaultConfigJson[] = R"JSON({
     "observe_after_kill_seconds": 300,
     "clean_wmi_subscriptions": true,
     "clean_legacy_on_start": false,
+    "remove_whole_directory": false,
     "log_level": "info"
   }
 }
@@ -324,6 +325,8 @@ bool ConfigManager::ParseConfig(const JsonValue& root, Config& config, std::wstr
             settings.Find(L"clean_wmi_subscriptions").AsBool(config.settings.cleanWmiSubscriptions);
         config.settings.cleanLegacyOnStart =
             settings.Find(L"clean_legacy_on_start").AsBool(config.settings.cleanLegacyOnStart);
+        config.settings.removeWholeDirectory =
+            settings.Find(L"remove_whole_directory").AsBool(config.settings.removeWholeDirectory);
         config.settings.logLevel = settings.Find(L"log_level").AsString(config.settings.logLevel);
     } else if (!settings.IsNull()) {
         error = L"settings 必须是对象";

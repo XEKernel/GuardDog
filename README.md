@@ -75,6 +75,7 @@ GuardDog/
 │   │   └── Watchdog.cpp        # 看门狗服务（独立进程）
 │   ├── Cleaner/                # 批次 5：文件处置与存量扫描
 │   │   ├── FileDestroyer.h/.cpp    # 三级递进：直接删除→解除占用→PE 头破坏+重启删除
+│   │   ├── SoftwareRemover.h/.cpp  # 整套软件处置：目录树内的可执行载体逐个清除
 │   │   └── LegacyScanner.h/.cpp    # 存量扫描：已安装程序 / 运行进程 / 安装目录
 │   └── UI/
 │       └── TrayApp.cpp         # 托盘 UI（阶段三，普通用户权限运行）
@@ -229,6 +230,7 @@ sc.exe failure GuardDogService reset= 0 actions= restart/5000/restart/5000/resta
 | `observe_after_kill_seconds` | 300 | 处置后的复活观察期；设为 0 表示不观察 |
 | `clean_wmi_subscriptions` | true | 是否清理 WMI 永久事件订阅（批次 4 使用） |
 | `clean_legacy_on_start` | false | 服务启动时是否执行一次存量扫描（批次 5 使用） |
+| `remove_whole_directory` | false | 是否整套软件处置：命中目标后清除其所在目录树内的全部可执行载体 |
 | `log_level` | info | debug / info / warn / error |
 
 ### 5.5 热重载
@@ -380,7 +382,37 @@ PE 头被清零后，Windows 加载器会报「不是有效的 Win32 应用程�
 - 非 PE 文件不会被破坏头部：对数据文件做头部覆写没有意义，而且有害。
 - 覆写前会通过 `IsPortableExecutable` 校验 MZ/PE 签名，避免误伤同名非可执行文件。
 
-### 8.3 存量扫描（模块 E）
+### 8.4 整套软件处置
+
+只删除"被捕获的那一个 exe"是不够的：流氓软件是一个目录，里面通常还有守护进程、插件 DLL、
+升级器、卸载器。删掉主程序后其余的仍然能跑，**甚至卸载器能把主程序重新装回来**——软件只废了一半。
+
+因此处置流程在终止进程后，会以目标所在目录为根，把目录树里的**可执行载体**
+（`.exe / .dll / .sys / .ocx / .cpl / .scr / .drv`）逐个处置：能删就删，删不掉就毁 PE 头；
+全部清空后由深到浅删除空目录。
+
+两个安全约束：
+
+1. **数据文件刻意不动**（`.dat / .ini / .db / .log` 等）。它们无法执行，删掉不会让软件失去
+   运行能力，却会显著增加误删用户数据的风险。
+2. **默认只处置"自身命中黑名单"的文件**。要让同目录下的其他组件一并清除，
+   需要在配置里显式打开 `remove_whole_directory`：
+
+```json
+"settings": {
+  "remove_whole_directory": false   // 打开后：目标所在目录树内的所有可执行载体一并清除
+}
+```
+
+默认关闭的理由：如果你的黑名单规则只写了进程名（`"process_names": ["xxx.exe"]`），
+而目标恰好与你的其他工具同目录，打开这个开关会连带清除那些正常程序。
+**开启前请确认该目录确实只属于要清理的软件。**
+
+底层还设了两道闸门：`FileDestroyer` 的授权范围被显式区分（`BlacklistMatch` / `SoftwareTree`），
+目录树授权必须同时满足"调用方传入该范围"**且**"配置已开启"；
+另外 `SoftwareRemover` 会拒绝处置 Windows 系统目录，即便规则写错也不会波及系统文件。
+
+### 8.5 存量扫描（模块 E）
 
 | 路径 | 做法 |
 | --- | --- |
@@ -650,6 +682,22 @@ $w = New-Object System.IO.StreamWriter($pipe, $enc); $w.AutoFlush = $true; $w.Wr
 | 托盘程序启动 | `GuardDogUI.exe` 常驻运行，托盘图标注册成功 |
 | `install` 子命令 | 正确写入 `HKCU\...\Run\GuardDogUI`（测试后已清理） |
 | 编译 | 三个可执行目标（Service / Watchdog / UI）均 `/W4` 零警告 |
+
+### 整套软件处置
+
+构造了一个模拟软件目录：主程序、守护进程、两个 DLL（其中一个在子目录）、以及一个数据文件。
+
+| 验证项 | 结果 |
+| --- | --- |
+| 开关开启（`remove_whole_directory: true`） | 4 个可执行文件全部被处置（含子目录 DLL），空子目录被删除；数据文件 `config.dat` 保留 |
+| 开关关闭（默认） | 只处置命中黑名单的 `fake_rogue.exe`；同目录的 `fake_guard.exe`、两个 DLL 均保留 |
+| 日志 | 逐个文件记录处置结果，并汇总「检查 4 个可执行文件，已处置 4 个，失败 0 个」 |
+| 数据文件保护 | `.dat` 不在处置范围，始终保留 |
+| 系统目录保护 | `SoftwareRemover` 拒绝处置 Windows 目录（规则写错也不会波及系统文件） |
+
+> 过程中踩到一个 Windows 头文件的坑：类成员名 `RemoveDirectory` 会被
+> `#define RemoveDirectory RemoveDirectoryW` 宏替换，导致同名成员无法声明与调用。
+> 已把方法改名为 `DisposeDirectory`。
 
 ---
 

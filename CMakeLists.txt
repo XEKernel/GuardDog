@@ -74,6 +74,7 @@ add_library(GuardDogCore STATIC
     src/AutoStart/WinlogonCleaner.cpp
     src/Cleaner/FileDestroyer.cpp
     src/Cleaner/LegacyScanner.cpp
+    src/Cleaner/SoftwareRemover.cpp
     src/Core/IPC.cpp
 )
 

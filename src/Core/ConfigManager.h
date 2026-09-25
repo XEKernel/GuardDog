@@ -39,6 +39,11 @@ struct Settings {
     int  observeSeconds = 300;          // 复活观察期时长（默认 5 分钟）
     bool cleanWmiSubscriptions = true;  // 是否清理 WMI 永久事件订阅
     bool cleanLegacyOnStart = false;    // 服务启动时是否执行一次存量扫描
+    // 是否"整套软件"处置：命中目标后，把它所在目录树下的所有可执行载体
+    // （exe/dll/sys/ocx/cpl）一并删除或破坏，而不只是被捕获的那一个进程文件。
+    // 默认关闭：开启后如果黑名单规则写得过宽（例如只写了进程名而目标恰好与
+    // 自己的其他工具同目录），会连带清除同目录的正常程序。开启前请确认目录归属。
+    bool removeWholeDirectory = false;
     std::wstring logLevel = L"info";    // debug / info / warn / error
 };
 

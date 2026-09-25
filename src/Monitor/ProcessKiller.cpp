@@ -2,6 +2,7 @@
 
 #include "AutoStart/AutoStartScanner.h"
 #include "Cleaner/FileDestroyer.h"
+#include "Cleaner/SoftwareRemover.h"
 #include "Core/ConfigManager.h"
 #include "Core/Logger.h"
 #include "Core/Matcher.h"
@@ -319,7 +320,12 @@ void CleanAutoStartEntries(const ProcessInfo& info) {
     GD_LOG_WARN(L"[处置] 自启动项断根结果：%s", result.Describe().c_str());
 }
 
-// 文件处置：删除源文件；删不掉就破坏 PE 头使其永久报废。
+// 文件处置：处置"整套软件"，而不只是被捕获的那一个进程文件。
+//
+// 只删一个 exe 是不够的：流氓软件目录里通常还有守护进程、插件 DLL、升级器、卸载器，
+// 删掉主程序后其余的仍然能跑，甚至卸载器能把主程序重新装回来。
+// 因此这里以目标目录为根，把目录树里的可执行载体逐个删除或破坏 PE 头。
+//
 // 放在终止进程之后执行——文件被占用是删除失败的头号原因，
 // 先让写它的进程消失，删除成功率会高得多。
 void DisposeTargetFile(const ProcessInfo& info) {
@@ -334,11 +340,11 @@ void DisposeTargetFile(const ProcessInfo& info) {
         return;
     }
 
-    const DestroyResult result = FileDestroyer::DestroyFile(*config, info.imagePath);
-    if (result.IsHandled()) {
-        GD_LOG_WARN(L"[处置] 文件处置：%s", result.Describe().c_str());
+    const SoftwareDisposalResult result = SoftwareRemover::RemoveSoftware(*config, info.imagePath);
+    if (result.filesFailed > 0) {
+        GD_LOG_ERROR(L"[处置] 软件整体处置存在失败项：%s", result.Describe().c_str());
     } else {
-        GD_LOG_ERROR(L"[处置] 文件处置失败：%s", result.Describe().c_str());
+        GD_LOG_WARN(L"[处置] 软件整体处置：%s", result.Describe().c_str());
     }
 }
 

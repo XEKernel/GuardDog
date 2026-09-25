@@ -23,6 +23,7 @@
 #include "AutoStart/AutoStartTypes.h"
 #include "Cleaner/FileDestroyer.h"
 #include "Cleaner/LegacyScanner.h"
+#include "Cleaner/SoftwareRemover.h"
 #include "Core/ConfigManager.h"
 #include "Core/Constants.h"
 #include "Core/IPC.h"
@@ -54,6 +55,8 @@ using GuardDog::ProcessKiller;
 using GuardDog::ProcessPoller;
 using GuardDog::ReadTextFileWide;
 using GuardDog::ScopeHandle;
+using GuardDog::SoftwareDisposalResult;
+using GuardDog::SoftwareRemover;
 using GuardDog::WmiMonitor;
 
 SERVICE_STATUS_HANDLE g_statusHandle = nullptr;
@@ -565,12 +568,13 @@ DWORD WINAPI WorkerThread(LPVOID /*param*/) {
                 continue;
             }
 
-            // 静态文件不在运行，无需挂起与终止，直接处置文件本身
-            const DestroyResult destroyResult = FileDestroyer::DestroyFile(*config, hit.path);
-            if (destroyResult.IsHandled()) {
-                GD_LOG_WARN(L"[存量清理] %s", destroyResult.Describe().c_str());
+            // 静态文件不在运行，无需挂起与终止，直接处置它所属的软件目录
+            const SoftwareDisposalResult disposeResult =
+                SoftwareRemover::RemoveSoftware(*config, hit.path);
+            if (disposeResult.filesFailed > 0) {
+                GD_LOG_ERROR(L"[存量清理] %s", disposeResult.Describe().c_str());
             } else {
-                GD_LOG_ERROR(L"[存量清理] %s", destroyResult.Describe().c_str());
+                GD_LOG_WARN(L"[存量清理] %s", disposeResult.Describe().c_str());
             }
         }
 

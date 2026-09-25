@@ -51,6 +51,7 @@
     "observe_after_kill_seconds": 300,
     "clean_wmi_subscriptions": true,
     "clean_legacy_on_start": false,
+    "remove_whole_directory": false,
     "log_level": "info"
   }
 }
