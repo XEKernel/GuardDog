@@ -192,14 +192,20 @@ void ShowInfo(const std::wstring& text, UINT flags = MB_OK | MB_ICONINFORMATION)
                 text.c_str(), L"GuardDog", flags | MB_SETFOREGROUND);
 }
 
-// 与服务通信；失败时给出明确原因，而不是静默无响应
-bool SendCommand(const std::wstring& request, std::wstring& response) {
+// 与服务通信。
+// showError 用于区分两类调用方：
+//   - 用户主动点按钮（扫描、放行）失败时必须弹框说明，否则会有"点了没反应"的困惑；
+//   - 状态区/日志区的自动刷新失败则不弹框——状态区本来就能显示原因，
+//     而且刚点完"停止服务"再刷新就弹一个错误框，会把正常操作渲染成"出故障了"。
+bool SendCommand(const std::wstring& request, std::wstring& response, bool showError = true) {
     if (!GuardDog::IpcClient::Send(request, response)) {
-        ShowInfo(L"无法连接到 GuardDog 服务。\n\n"
-                 L"可能的原因：\n"
-                 L"  - 主服务未安装或未启动（sc start GuardDogService）\n"
-                 L"  - 服务正在重启中，稍后重试",
-                 MB_OK | MB_ICONWARNING);
+        if (showError) {
+            ShowInfo(L"无法连接到 GuardDog 服务。\n\n"
+                     L"可能的原因：\n"
+                     L"  - 主服务未安装或未启动（可用界面上的「启动服务」按钮）\n"
+                     L"  - 服务正在重启中，稍后重试",
+                     MB_OK | MB_ICONWARNING);
+        }
         return false;
     }
     return true;
@@ -311,10 +317,16 @@ void RefreshStatus() {
     }
 
     std::wstring response;
-    if (!SendCommand(L"STATUS", response)) {
+    if (!SendCommand(L"STATUS", response, false)) {
+        // 静默失败：在状态区把原因和下一步说清楚，而不是弹模态框打断用户
         if (g_statusText != nullptr) {
-            SetWindowTextW(g_statusText, L"无法连接到 GuardDog 服务。\r\n"
-                                        L"请确认 GuardDogService 已启动。");
+            SetWindowTextW(g_statusText,
+                           IsMainServiceRunning()
+                               ? L"防护服务正在启动中…请稍后点击「刷新状态」。"
+                               : L"防护服务当前未运行。\r\n\r\n"
+                                 L"点击下方的「启动服务」即可恢复防护（会弹出 UAC 授权窗口）。\r\n"
+                                 L"若尚未安装服务，请以管理员身份执行：\r\n"
+                                 L"    GuardDogService.exe install");
         }
         return;
     }
@@ -326,8 +338,8 @@ void RefreshStatus() {
 
 void RefreshLog() {
     std::wstring response;
-    if (!SendCommand(L"LOG|200", response)) {
-        return;
+    if (!SendCommand(L"LOG|200", response, false)) {
+        return;  // 日志拉取失败不打扰用户，状态区已经说明了服务状态
     }
     if (g_logEdit != nullptr) {
         const std::wstring text = StripStatusPrefix(response);
