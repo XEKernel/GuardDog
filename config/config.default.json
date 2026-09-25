@@ -1,0 +1,56 @@
+{
+  "_说明": "GuardDog 配置。白名单优先级高于黑名单；保存后服务会自动热重载，无需重启。本文件是源码树中的参考副本，服务首次启动时会在 C:\\ProgramData\\GuardDog\\config.json 生成同样内容的默认配置。",
+
+  "blacklist": [
+    {
+      "name": "示例规则（默认停用，请改成你要拦截的软件）",
+      "enabled": false,
+      "process_names": ["流氓进程.exe", "推广*.exe"],
+      "paths": ["C:\\Program Files\\流氓软件\\*", "C:\\Program Files (x86)\\流氓软件\\*"],
+      "signers": ["某某公司"],
+      "hashes": ["sha256:0000000000000000000000000000000000000000000000000000000000000000"]
+    }
+  ],
+
+  "whitelist": {
+    "process_names": [
+      "explorer.exe", "svchost.exe", "lsass.exe", "csrss.exe", "winlogon.exe",
+      "services.exe", "wininit.exe", "smss.exe", "dwm.exe", "taskhostw.exe",
+      "sihost.exe", "ctfmon.exe", "fontdrvhost.exe", "runtimebroker.exe",
+      "searchindexer.exe", "spoolsv.exe", "audiodg.exe", "conhost.exe", "dllhost.exe",
+      "msmpeng.exe", "nissrv.exe", "securityhealthservice.exe", "securityhealthsystray.exe",
+      "sppsvc.exe", "trustedinstaller.exe", "tiworker.exe", "wuauclt.exe",
+      "mousocoreworker.exe", "usoclient.exe", "taskmgr.exe", "regedit.exe",
+      "chrome.exe", "msedge.exe", "firefox.exe", "wechat.exe", "qq.exe", "dingtalk.exe"
+    ],
+    "paths": [
+      "C:\\Windows\\System32\\*",
+      "C:\\Windows\\SysWOW64\\*",
+      "C:\\Windows\\WinSxS\\*",
+      "C:\\Windows\\servicing\\*",
+      "C:\\Program Files\\Windows Defender\\*",
+      "C:\\Program Files\\Windows NT\\*",
+      "C:\\Program Files\\Windows Mail\\*",
+      "C:\\Program Files\\Microsoft*",
+      "C:\\Program Files (x86)\\Microsoft*",
+      "C:\\Program Files\\Google\\*",
+      "C:\\Program Files (x86)\\Google\\*"
+    ],
+    "signers": [
+      "Microsoft Corporation",
+      "Microsoft Windows"
+    ],
+    "hashes": []
+  },
+
+  "settings": {
+    "poll_interval_ms": 500,
+    "wmi_enabled": true,
+    "destroy_pe_header": true,
+    "delay_delete_on_reboot": true,
+    "observe_after_kill_seconds": 300,
+    "clean_wmi_subscriptions": true,
+    "clean_legacy_on_start": false,
+    "log_level": "info"
+  }
+}

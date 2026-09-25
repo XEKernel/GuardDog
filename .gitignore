@@ -1,0 +1,42 @@
+# ---- 构建产物 ----
+build/
+out/
+bin/
+obj/
+
+*.obj
+*.exe
+*.dll
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.idb
+*.res
+*.tlog
+*.iobj
+*.ipdb
+
+# ---- Visual Studio / CMake ----
+.vs/
+*.user
+*.suo
+*.sln.docstates
+CMakeSettings.json
+CMakeUserPresets.json
+compile_commands.json
+*.vcxproj
+*.vcxproj.filters
+
+# ---- 运行时产物（服务在 ProgramData 下生成，不应入库）----
+config/config.json
+*.log
+
+# ---- 编辑器与临时文件 ----
+.vscode/
+.idea/
+*.tmp
+*.bak
+*~
+Thumbs.db
+desktop.ini
