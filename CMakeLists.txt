@@ -72,6 +72,8 @@ add_library(GuardDogCore STATIC
     src/AutoStart/IfeoCleaner.cpp
     src/AutoStart/AppInitCleaner.cpp
     src/AutoStart/WinlogonCleaner.cpp
+    src/Cleaner/FileDestroyer.cpp
+    src/Cleaner/LegacyScanner.cpp
 )
 
 target_include_directories(GuardDogCore PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -80,12 +82,13 @@ target_include_directories(GuardDogCore PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 # crypt32  —— 解析 PKCS#7 签名、提取签名者证书、catalog 查找
 # wintrust —— WinVerifyTrust 签名策略校验
 # wbemuuid —— WMI 的 CLSID_WbemLocator / IID_IWbemLocator 等 GUID 定义
-# shell32  —— SHGetKnownFolderPath（启动文件夹定位）、IShellLink（解析 .lnk）
+# shell32  —— SHGetKnownFolderPath（启动文件夹/常见安装目录定位）、IShellLink
 # ole32    —— COM 初始化与实例化
 # oleaut32 —— BSTR 与 VARIANT 操作（WMI 属性读取）
 # uuid     —— IID_IShellLinkW / IID_IPersistFile 等接口 IID
+# RstrtMgr —— Restart Manager：找出正在占用目标文件的进程
 target_link_libraries(GuardDogCore PUBLIC
-    bcrypt crypt32 wintrust wbemuuid shell32 ole32 oleaut32 uuid)
+    bcrypt crypt32 wintrust wbemuuid shell32 ole32 oleaut32 uuid RstrtMgr)
 
 # ---------------------------------------------------------------------------
 # GuardDogService：服务主程序

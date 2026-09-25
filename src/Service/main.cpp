@@ -20,6 +20,8 @@
 #include <mutex>
 #include <string>
 
+#include "Cleaner/FileDestroyer.h"
+#include "Cleaner/LegacyScanner.h"
 #include "Core/ConfigManager.h"
 #include "Core/Constants.h"
 #include "Core/Logger.h"
@@ -33,6 +35,10 @@ namespace {
 
 using GuardDog::ConfigManager;
 using GuardDog::Constants::kServiceName;
+using GuardDog::DestroyResult;
+using GuardDog::FileDestroyer;
+using GuardDog::LegacyScanner;
+using GuardDog::LegacyScanResult;
 using GuardDog::Logger;
 using GuardDog::LogLevel;
 using GuardDog::MatchResult;
@@ -335,6 +341,31 @@ DWORD WINAPI WorkerThread(LPVOID /*param*/) {
     if (config) {
         GD_LOG_INFO(L"执行启动存量检查：扫描当前运行中的进程");
         poller.ScanNow(*config, submitFromScan);
+        HandlePendingThreats();
+    }
+
+    // 存量清理（模块 E）：由配置项 clean_legacy_on_start 控制，默认关闭。
+    // 默认关闭的理由：它会大范围扫描磁盘与注册表，并可能删除已存在的软件，
+    // 这类动作应当由用户明确开启，而不是装上服务就自动发生。
+    if (config && config->settings.cleanLegacyOnStart) {
+        const LegacyScanResult legacyResult = LegacyScanner::Scan(*config);
+
+        for (const LegacyScanResult::Hit& hit : legacyResult.hits) {
+            if (hit.processId != 0) {
+                // 运行中的进程走标准处置流程（挂起 → 断根 → 终止 → 删文件）
+                EnqueueThreat(hit.processId, hit.path, L"存量扫描-运行进程");
+                continue;
+            }
+
+            // 静态文件不在运行，无需挂起与终止，直接处置文件本身
+            const DestroyResult destroyResult = FileDestroyer::DestroyFile(*config, hit.path);
+            if (destroyResult.IsHandled()) {
+                GD_LOG_WARN(L"[存量清理] %s", destroyResult.Describe().c_str());
+            } else {
+                GD_LOG_ERROR(L"[存量清理] %s", destroyResult.Describe().c_str());
+            }
+        }
+
         HandlePendingThreats();
     }
 

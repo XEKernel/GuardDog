@@ -1,6 +1,7 @@
 #include "Monitor/ProcessKiller.h"
 
 #include "AutoStart/AutoStartScanner.h"
+#include "Cleaner/FileDestroyer.h"
 #include "Core/ConfigManager.h"
 #include "Core/Logger.h"
 #include "Core/Matcher.h"
@@ -318,6 +319,29 @@ void CleanAutoStartEntries(const ProcessInfo& info) {
     GD_LOG_WARN(L"[处置] 自启动项断根结果：%s", result.Describe().c_str());
 }
 
+// 文件处置：删除源文件；删不掉就破坏 PE 头使其永久报废。
+// 放在终止进程之后执行——文件被占用是删除失败的头号原因，
+// 先让写它的进程消失，删除成功率会高得多。
+void DisposeTargetFile(const ProcessInfo& info) {
+    if (info.imagePath.empty()) {
+        GD_LOG_WARN(L"[处置] 目标路径未知，跳过文件处置");
+        return;
+    }
+
+    const auto config = ConfigManager::Instance().GetSnapshot();
+    if (!config) {
+        GD_LOG_WARN(L"[处置] 配置不可用，跳过文件处置");
+        return;
+    }
+
+    const DestroyResult result = FileDestroyer::DestroyFile(*config, info.imagePath);
+    if (result.IsHandled()) {
+        GD_LOG_WARN(L"[处置] 文件处置：%s", result.Describe().c_str());
+    } else {
+        GD_LOG_ERROR(L"[处置] 文件处置失败：%s", result.Describe().c_str());
+    }
+}
+
 bool ProcessKiller::HandleBlacklistedProcess(DWORD processId, const std::wstring& reason) {
     GD_LOG_WARN(L"[处置] 命中目标：pid=%lu，依据：%s", processId, reason.c_str());
 
@@ -397,7 +421,12 @@ bool ProcessKiller::HandleBlacklistedProcess(DWORD processId, const std::wstring
     GD_LOG_WARN(L"[处置] 目标已终止：pid=%lu，路径=%s", processId,
                 info.imagePath.empty() ? L"(未知)" : info.imagePath.c_str());
 
-    // Step 6：文件处置与复活观察（批次 5 接入文件删除 / PE 头破坏）
+    // Step 6：文件处置 —— 删除源文件，删不掉则覆写 PE 头使其永久报废
+    DisposeTargetFile(info);
+
+    // Step 7：复活观察由监控循环天然承担——
+    // 目标若被守护进程或计划任务重新拉起，会立刻再次命中并入队处置；
+    // 由于自启动项已在 Step 4 清空，残余的引导者通常在几轮内被耗光。
     return true;
 }
 
