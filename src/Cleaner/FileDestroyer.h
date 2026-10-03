@@ -62,6 +62,14 @@ public:
     // 判断是否是可执行映像（PE）。非 PE 文件破坏头部没有意义，也不该动它。
     static bool IsPortableExecutable(const std::wstring& path);
 
+    // 目录树处置的准入检查（纵深防御）。
+    //
+    // 拒绝盘根（C:）与系统关键目录：整树处置是递归删除，一旦目录算错，
+    // 后果是灾难性的。最典型的错法——目标是 C:\evil.exe 时，取"所在目录"
+    // 会得到 C:，递归就从整个盘铺开。即使黑名单确实命中，这类位置也必须
+    // 由用户手工处理。传入文件路径时按它所在目录判断。
+    static bool IsTreeDisposalAllowed(const std::wstring& pathOrDirectory);
+
     // 找出正在占用该文件的进程 PID（Restart Manager，官方接口）
     static std::vector<DWORD> FindProcessesLockingFile(const std::wstring& path);
 };

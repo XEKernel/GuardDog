@@ -63,6 +63,13 @@ void DisposeDirectoryTree(const Config& config, const std::wstring& directory,
         return;
     }
 
+    // 递归前的准入检查：盘根与系统关键目录一律不递归。
+    // 这里是最危险的一处——本函数会递归删除，目录一旦算错就不可收拾。
+    if (!FileDestroyer::IsTreeDisposalAllowed(directory)) {
+        GD_LOG_ERROR(L"[软件处置] 跳过危险位置：%s", directory.c_str());
+        return;
+    }
+
     WIN32_FIND_DATAW findData{};
     HANDLE find = FindFirstFileW((directory + L"\\*").c_str(), &findData);
     if (find == INVALID_HANDLE_VALUE) {
@@ -78,6 +85,13 @@ void DisposeDirectoryTree(const Config& config, const std::wstring& directory,
         }
         const std::wstring fullPath = directory + L"\\" + findData.cFileName;
         if ((findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+            // 不跟随重解析点（junction / 符号链接）：它们本身不是真实子目录，
+            // 递归进去等于把处置动作导向链接指向的任意位置——可能是用户的重要数据，
+            // 也可能是另一个盘符。流氓软件完全可以用这种方式把删除引开。
+            if ((findData.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+                GD_LOG_WARN(L"[软件处置] 跳过重解析点目录（不跟随链接）：%s", fullPath.c_str());
+                continue;
+            }
             subDirectories.push_back(fullPath);
         } else {
             files.push_back(fullPath);

@@ -33,6 +33,7 @@
 #include "Monitor/ProcessKiller.h"
 #include "Monitor/ProcessPoller.h"
 #include "Monitor/WmiMonitor.h"
+#include "Monitor/InstallWatcher.h"
 #include "Service/ServiceInstaller.h"
 
 #include <fstream>
@@ -45,6 +46,7 @@ using GuardDog::Constants::kServiceName;
 using GuardDog::DestroyResult;
 using GuardDog::FileDestroyer;
 using GuardDog::IpcServer;
+using GuardDog::InstallWatcher;
 using GuardDog::LegacyScanner;
 using GuardDog::LegacyScanResult;
 using GuardDog::Logger;
@@ -612,6 +614,9 @@ DWORD WINAPI WorkerThread(LPVOID /*param*/) {
                 // 规则集变了，之前缓存的"某路径的签名者/哈希"结论不再对应新配置，清掉重算
                 Matcher::ClearIdentityCache();
                 poller.Reset();  // 轮询间隔可能被改过
+                // 规则集变了，"新装目录是否命中"的结论必须重新判定，
+                // 否则会拿旧规则把待清理目录删掉
+                InstallWatcher::Reset();
                 config = ConfigManager::Instance().GetSnapshot();
             }
         }
@@ -648,7 +653,11 @@ DWORD WINAPI WorkerThread(LPVOID /*param*/) {
             EnsureWatchdogRunning();
         }
 
-        // 5) 串行处置（放在最后，确保本轮的所有发现路径都已执行过）
+        // 5) 安装拦截：监视常见安装根目录下新建的目录，命中黑名单规则即整体清理。
+        //    这是"阻止软件安装"的实现路径——进程监控只能拦住装好之后运行的程序。
+        InstallWatcher::Poll(*config);
+
+        // 6) 串行处置（放在最后，确保本轮的所有发现路径都已执行过）
         HandlePendingThreats();
     }
 

@@ -71,6 +71,7 @@ constexpr char kDefaultConfigJson[] = R"JSON({
     "clean_wmi_subscriptions": true,
     "clean_legacy_on_start": false,
     "remove_whole_directory": false,
+    "block_install": true,
     "startup_mode": "gui",
     "log_level": "info"
   }
@@ -328,6 +329,8 @@ bool ConfigManager::ParseConfig(const JsonValue& root, Config& config, std::wstr
             settings.Find(L"clean_legacy_on_start").AsBool(config.settings.cleanLegacyOnStart);
         config.settings.removeWholeDirectory =
             settings.Find(L"remove_whole_directory").AsBool(config.settings.removeWholeDirectory);
+        config.settings.blockInstall =
+            settings.Find(L"block_install").AsBool(config.settings.blockInstall);
         config.settings.startupMode = settings.Find(L"startup_mode").AsString(config.settings.startupMode);
         if (_wcsicmp(config.settings.startupMode.c_str(), L"gui") != 0 &&
             _wcsicmp(config.settings.startupMode.c_str(), L"hidden") != 0) {

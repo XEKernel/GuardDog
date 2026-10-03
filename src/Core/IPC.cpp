@@ -5,6 +5,7 @@
 #include "Core/ScopeHandle.h"
 
 #include <algorithm>
+#include <sddl.h>  // ConvertStringSecurityDescriptorToSecurityDescriptorW（管道访问控制）
 
 namespace GuardDog {
 
@@ -94,12 +95,34 @@ void IpcServer::Run() {
             break;
         }
 
+        // 管道安全描述符：CreateNamedPipeW 的默认描述符允许**任何本机进程**连接，
+        // 而管道能执行"临时放行"动作——那等于让任意程序给自己开绿灯。
+        // 这里把访问权限收紧到 SYSTEM、本机管理员与交互登录用户（前端属于后者）：
+        //    SY = LocalSystem，BA = Builtin Administrators，IU = 交互登录用户
+        // PIPE_REJECT_REMOTE_CLIENTS 另外拒绝一切远程连接；
+        // FILE_FLAG_FIRST_PIPE_INSTANCE 则保证本服务是管道的首位创建者——
+        // 否则其他进程可以抢先建同名管道冒充 GuardDog 服务，前端就会连到假的上去。
+        SECURITY_ATTRIBUTES securityAttributes{};
+        PSECURITY_DESCRIPTOR securityDescriptor = nullptr;
+        if (ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                L"D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)", SDDL_REVISION_1, &securityDescriptor,
+                nullptr)) {
+            securityAttributes.nLength = sizeof(securityAttributes);
+            securityAttributes.lpSecurityDescriptor = securityDescriptor;
+        }
+
         ScopeHandle pipe;
-        pipe.Reset(CreateNamedPipeW(kPipeName, PIPE_ACCESS_DUPLEX,
-                                    PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
-                                    1,  // 单实例：UI 只有一个，串行处理足够
-                                    kMaxMessageChars * sizeof(wchar_t),
-                                    kMaxMessageChars * sizeof(wchar_t), kIoTimeoutMs, nullptr));
+        pipe.Reset(CreateNamedPipeW(
+            kPipeName, PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
+            PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+            1,  // 单实例：UI 只有一个，串行处理足够
+            kMaxMessageChars * sizeof(wchar_t), kMaxMessageChars * sizeof(wchar_t), kIoTimeoutMs,
+            securityDescriptor != nullptr ? &securityAttributes : nullptr));
+
+        // CreateNamedPipeW 已复制描述符内容，这里可以立即释放
+        if (securityDescriptor != nullptr) {
+            LocalFree(securityDescriptor);
+        }
         if (!pipe.IsValid()) {
             GD_LOG_WARN(L"IPC：创建管道失败（错误 %lu），稍后重试", GetLastError());
             Sleep(1000);

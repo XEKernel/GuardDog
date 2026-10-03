@@ -62,6 +62,7 @@ add_library(GuardDogCore STATIC
     src/Monitor/ProcessKiller.cpp
     src/Monitor/ProcessPoller.cpp
     src/Monitor/WmiMonitor.cpp
+    src/Monitor/InstallWatcher.cpp
     src/AutoStart/AutoStartTypes.cpp
     src/AutoStart/AutoStartScanner.cpp
     src/AutoStart/RegistryRun.cpp

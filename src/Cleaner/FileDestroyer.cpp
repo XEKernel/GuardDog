@@ -206,6 +206,66 @@ bool FileDestroyer::OverwritePeHeader(const std::wstring& path) {
     return false;
 }
 
+bool FileDestroyer::IsTreeDisposalAllowed(const std::wstring& pathOrDirectory) {
+    std::wstring directory = pathOrDirectory;
+
+    // 传入文件路径时按它所在目录判断（调用方通常给的是目标文件）
+    const DWORD attributes = GetFileAttributesW(directory.c_str());
+    if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+        const size_t separator = directory.find_last_of(L"\\/");
+        directory = (separator == std::wstring::npos) ? std::wstring() : directory.substr(0, separator);
+    }
+
+    // 统一成不带尾部分隔符的形式，便于比较
+    while (!directory.empty() && (directory.back() == L'\\' || directory.back() == L'/')) {
+        directory.pop_back();
+    }
+
+    // 盘根（"C:"）或空路径：直接拒绝
+    if (directory.size() <= 2) {
+        GD_LOG_ERROR(L"拒绝整树处置盘根目录：%s", pathOrDirectory.c_str());
+        return false;
+    }
+
+    // 保护位置分两类，判定方式不同——这是关键区别：
+    //   系统目录：本身与其下所有子目录都拒绝（整树清理系统目录没有正当场景）
+    //   公共场所：只拒绝目录本身。它们下面按软件名分的子目录（Program Files\某软件）
+    //             正是正常的清理目标，连子目录一起拒绝等于让功能失效
+    static const wchar_t* const kSystemRoots[] = {
+        L"C:\\Windows",
+        L"C:\\Program Files\\Common Files",
+        L"C:\\Program Files (x86)\\Common Files",
+        L"C:\\Program Files\\WindowsApps",
+    };
+    static const wchar_t* const kSharedRoots[] = {
+        L"C:\\Program Files",
+        L"C:\\Program Files (x86)",
+        L"C:\\ProgramData",
+        L"C:\\Users",
+    };
+
+    for (const wchar_t* systemRoot : kSystemRoots) {
+        const size_t length = wcslen(systemRoot);
+        // 含边界检查的前缀比较：C:\Windows.old 不该被 C:\Windows 误伤
+        if (_wcsnicmp(directory.c_str(), systemRoot, length) == 0 &&
+            (directory.size() == length || directory[length] == L'\\')) {
+            GD_LOG_ERROR(L"拒绝整树处置系统目录：%s", directory.c_str());
+            return false;
+        }
+    }
+
+    for (const wchar_t* sharedRoot : kSharedRoots) {
+        // 完全相等才拒绝（忽略大小写）：只拦"目录本身"，放行其下的软件子目录
+        if (directory.size() == wcslen(sharedRoot) &&
+            _wcsnicmp(directory.c_str(), sharedRoot, directory.size()) == 0) {
+            GD_LOG_ERROR(L"拒绝整树处置公共目录本身：%s", directory.c_str());
+            return false;
+        }
+    }
+
+    return true;
+}
+
 DestroyResult FileDestroyer::DestroyFile(const Config& config, const std::wstring& path,
                                          DisposeScope scope) {
     DestroyResult result;
@@ -229,6 +289,15 @@ DestroyResult FileDestroyer::DestroyFile(const Config& config, const std::wstrin
 
     if (!authorized) {
         GD_LOG_ERROR(L"拒绝处置未授权文件：%s", path.c_str());
+        result.outcome = DestroyOutcome::Rejected;
+        return result;
+    }
+
+    // 纵深防御：即使已获得目录树授权，危险位置也一律拒绝。
+    // 授权来自调用方，而调用方传入的目录往往是从进程路径推导出来的——
+    // 如果目标恰好在盘根下，整树处置就会从整个盘铺开。
+    if (scope == DisposeScope::SoftwareTree && !IsTreeDisposalAllowed(path)) {
+        GD_LOG_ERROR(L"拒绝整树处置危险位置：%s", path.c_str());
         result.outcome = DestroyOutcome::Rejected;
         return result;
     }
