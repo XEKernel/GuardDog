@@ -4,6 +4,8 @@
 
 #include <atomic>
 #include <functional>
+#include <memory>
+#include <mutex>
 #include <string>
 
 #include "Core/ComPtr.h"
@@ -16,7 +18,17 @@ struct IWbemServices;
 
 namespace GuardDog {
 
-class ProcessStartSink;
+// WMI 回调的共享状态，定义在 .cpp（这里只前向声明）。
+//
+// WMI 会从自己的线程池调用 sink 的 Indicate，而 CancelAsyncCall 取消订阅时
+// 并不会等待在途回调返回。若回调直接触碰 WmiMonitor 实例，一旦本对象（或其
+// 所在作用域）先被销毁，就会 use-after-free。把回调与运行标志放进这个由
+// sink 与 WmiMonitor 共同持有的 shared_ptr，回调便只依赖该状态，不再依赖
+// WmiMonitor 实例本身。
+//
+// 注意：该类型必须能在头文件里按名引用（m_state 成员），因此留在 GuardDog
+// 命名空间中，不能放进 .cpp 的匿名命名空间。
+struct WmiMonitorState;
 
 // 进程创建事件的即时监控（主方案）。
 //
@@ -38,26 +50,22 @@ public:
     HRESULT Start(const ProcessCallback& callback);
     void Stop();
 
-    bool IsRunning() const { return m_running.load(); }
+    bool IsRunning() const;
 
     // 订阅异常中断（例如 WMI 服务重启）时置位，由主循环决定何时重建订阅
-    bool NeedsReconnect() const { return m_needsReconnect.load(); }
-    void ClearReconnectFlag() { m_needsReconnect.store(false); }
+    bool NeedsReconnect() const;
+    void ClearReconnectFlag();
 
 private:
-    friend class ProcessStartSink;
-
-    void OnProcessStarted(DWORD processId, const std::wstring& processName);
-    void OnSubscriptionBroken(HRESULT result);
-
     ComPtr<IWbemLocator> m_locator;
     ComPtr<IWbemServices> m_service;
     ComPtr<IWbemObjectSink> m_sink;
-    ProcessCallback m_callback;
+
+    // 与 sink 共享的回调/运行状态；sink 持有一份，因此即使本对象先销毁，
+    // 在途回调操作的状态仍然有效。
+    std::shared_ptr<WmiMonitorState> m_state;
 
     bool m_comInitialized = false;
-    std::atomic<bool> m_running{false};
-    std::atomic<bool> m_needsReconnect{false};
 };
 
 } // namespace GuardDog

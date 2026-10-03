@@ -71,7 +71,16 @@ void IpcServer::Stop() {
         CloseHandle(wakeup);
     }
 
-    WaitForSingleObject(m_thread, 5000);
+    const DWORD waitResult = WaitForSingleObject(m_thread, 5000);
+    if (waitResult != WAIT_OBJECT_0) {
+        // 超时说明监听线程可能仍阻塞在 ConnectNamedPipe / ReadFile 上，并正在使用
+        // m_stopEvent。此时关闭线程/事件句柄会让在途代码操作已关闭对象
+        // （use-after-close），成员被置空后再次进入 Stop 还会拿到悬空值。
+        // 进程即将退出，交给系统统一回收比强行关闭正在被使用的句柄更安全。
+        GD_LOG_ERROR(L"IPC：等待监听线程退出超时（错误 %lu），跳过句柄释放", GetLastError());
+        return;
+    }
+
     CloseHandle(m_thread);
     m_thread = nullptr;
 

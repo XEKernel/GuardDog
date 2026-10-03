@@ -22,6 +22,21 @@ struct IdentityEntry {
     bool hashResolved = false;
     std::wstring signer;  // 空字符串表示"未签名或校验失败"，同样需要缓存，避免反复做昂贵校验
     std::wstring hash;
+
+    // 缓存只按路径做键，若同一路径的文件被替换（流氓软件自我更新），旧文件的
+    // 签名者/哈希结论会被错误地套用到新文件上，可能让新文件借旧结论通过白名单。
+    // 记录文件大小与最后写入时间，命中时比对，识别出"同名不同文件"从而强制重算。
+    //
+    // 两个维度各自记录时间戳，不共用：签名与哈希是分别按需计算的，
+    // 若共用一个时间戳，"先重算签名（顺带刷新了时间戳）、而哈希还是旧文件的结论"
+    // 会被误判为新鲜缓存——那正是要堵的绕过路径。有些文件只查签名、有些只查哈希，
+    // 共用时间戳时这种混合状态出现得相当频繁。
+    ULONGLONG signerSize = 0;
+    FILETIME signerWriteTime{};
+    bool signerStampValid = false;
+    ULONGLONG hashSize = 0;
+    FILETIME hashWriteTime{};
+    bool hashStampValid = false;
 };
 
 std::mutex g_identityMutex;
@@ -30,6 +45,27 @@ std::unordered_map<std::wstring, IdentityEntry> g_identityCache;
 // 缓存上限：防止长时间运行时被大量临时路径撑爆内存。
 // 满了整体清空而不做 LRU——实现简单，最坏代价只是重新计算一遍。
 constexpr size_t kMaxIdentityCacheEntries = 4096;
+
+// 读取文件的大小与最后写入时间。取不到（文件不存在/被占用）时返回 false，
+// 调用方据此把 stampValid 置为 false，后续每次都重算而不是信任可能过期的缓存。
+bool QueryFileStamp(const std::wstring& path, ULONGLONG& size, FILETIME& writeTime) {
+    WIN32_FILE_ATTRIBUTE_DATA data{};
+    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &data)) {
+        return false;
+    }
+    size = (static_cast<ULONGLONG>(data.nFileSizeHigh) << 32) | data.nFileSizeLow;
+    writeTime = data.ftLastWriteTime;
+    return true;
+}
+
+// 判断某个维度记录的缓存时间戳是否与当前文件一致。
+// valid 为 false 表示写入缓存时就没取到时间戳，此时一律视为不匹配，强制重算。
+bool SameStamp(bool valid, ULONGLONG cachedSize, const FILETIME& cachedWriteTime,
+               ULONGLONG size, const FILETIME& writeTime) {
+    return valid && cachedSize == size &&
+           cachedWriteTime.dwLowDateTime == writeTime.dwLowDateTime &&
+           cachedWriteTime.dwHighDateTime == writeTime.dwHighDateTime;
+}
 
 std::wstring LowerCopy(const std::wstring& text) {
     std::wstring result = text;
@@ -42,10 +78,16 @@ std::wstring LowerCopy(const std::wstring& text) {
 void LookupCachedSigner(const std::wstring& path, std::wstring& signer) {
     const std::wstring key = LowerCopy(path);
 
+    ULONGLONG size = 0;
+    FILETIME writeTime{};
+    const bool stampOk = QueryFileStamp(path, size, writeTime);
+
     {
         std::lock_guard<std::mutex> lock(g_identityMutex);
         const auto it = g_identityCache.find(key);
-        if (it != g_identityCache.end() && it->second.signerResolved) {
+        if (it != g_identityCache.end() && it->second.signerResolved &&
+            SameStamp(it->second.signerStampValid, it->second.signerSize,
+                      it->second.signerWriteTime, size, writeTime)) {
             signer = it->second.signer;
             return;
         }
@@ -62,6 +104,9 @@ void LookupCachedSigner(const std::wstring& path, std::wstring& signer) {
         IdentityEntry& entry = g_identityCache[key];
         entry.signerResolved = true;
         entry.signer = verified ? computed : std::wstring();
+        entry.signerSize = size;
+        entry.signerWriteTime = writeTime;
+        entry.signerStampValid = stampOk;
     }
 
     signer = verified ? computed : std::wstring();
@@ -70,10 +115,16 @@ void LookupCachedSigner(const std::wstring& path, std::wstring& signer) {
 void LookupCachedHash(const std::wstring& path, std::wstring& hash) {
     const std::wstring key = LowerCopy(path);
 
+    ULONGLONG size = 0;
+    FILETIME writeTime{};
+    const bool stampOk = QueryFileStamp(path, size, writeTime);
+
     {
         std::lock_guard<std::mutex> lock(g_identityMutex);
         const auto it = g_identityCache.find(key);
-        if (it != g_identityCache.end() && it->second.hashResolved) {
+        if (it != g_identityCache.end() && it->second.hashResolved &&
+            SameStamp(it->second.hashStampValid, it->second.hashSize,
+                      it->second.hashWriteTime, size, writeTime)) {
             hash = it->second.hash;
             return;
         }
@@ -90,6 +141,9 @@ void LookupCachedHash(const std::wstring& path, std::wstring& hash) {
         IdentityEntry& entry = g_identityCache[key];
         entry.hashResolved = true;
         entry.hash = computedOk ? computed : std::wstring();
+        entry.hashSize = size;
+        entry.hashWriteTime = writeTime;
+        entry.hashStampValid = stampOk;
     }
 
     hash = computedOk ? computed : std::wstring();

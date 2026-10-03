@@ -103,8 +103,14 @@ CleanResult CleanWinlogon(const Config& config, const AutoStartTarget& /*target*
 
     RegKey key;
     if (!key.Open(HKEY_LOCAL_MACHINE, kWinlogonKey, KEY_READ | KEY_WRITE)) {
-        GD_LOG_WARN(L"打开 Winlogon 注册表键失败：错误 %lu", GetLastError());
-        return result;
+        // 没有写权限时退回只读打开：至少要保证"能发现"被劫持的值并提示用户，
+        // 而不是让整个扫描被静默跳过。清理阶段若因只读句柄写入/删除失败，
+        // 会在 RestoreOrCheck 里按 result.failed 计数，不会被当成成功。
+        if (!key.Open(HKEY_LOCAL_MACHINE, kWinlogonKey, KEY_READ)) {
+            GD_LOG_WARN(L"打开 Winlogon 注册表键失败：错误 %lu", GetLastError());
+            return result;
+        }
+        GD_LOG_WARN(L"打开 Winlogon 注册表键无写权限，本次只扫描不清理");
     }
 
     result = RestoreOrCheck(config, key, L"Shell", kDefaultShell, false, clean, result);

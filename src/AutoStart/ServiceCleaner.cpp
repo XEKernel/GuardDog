@@ -33,6 +33,14 @@ bool IsServiceAlreadyRemoved(const std::wstring& serviceName) {
 
 void MarkServiceRemoved(const std::wstring& serviceName) {
     std::lock_guard<std::mutex> lock(g_removedServicesMutex);
+    // 容量保护：一次运行正常不会有这么多服务被删除，达到上限说明集合已无界增长
+    // （或遭大量伪造服务名灌入）。整体清空是安全的——最坏后果只是把已处理好的
+    // 服务在"复查"里重新报一次残留（提示噪音），不会造成误删：是否删除始终
+    // 由黑名单命中决定，与这个记录集合无关。
+    if (g_removedServices.size() >= 1024) {
+        GD_LOG_DEBUG(L"已删除服务记录达到上限，清空以避免无界增长");
+        g_removedServices.clear();
+    }
     g_removedServices.insert(serviceName);
 }
 

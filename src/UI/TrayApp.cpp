@@ -21,6 +21,7 @@
 #include "Core/Constants.h"
 #include "Core/IPC.h"
 #include "Core/Json.h"
+#include "UI/RuleManager.h"
 
 #pragma comment(lib, "shell32.lib")
 
@@ -52,6 +53,7 @@ enum ControlId : int {
     kIdHide,
     kIdAbout,
     kIdExit,
+    kIdRules,   // 规则管理（可视化配置）
 };
 
 HWND g_mainWindow = nullptr;
@@ -248,7 +250,7 @@ void CreateControls(HWND window) {
     };
     const ButtonSpec specs[] = {
         {kIdRefresh, L"刷新状态"},     {kIdFullLog, L"完整日志"},
-        {kIdScan, L"手动扫描"},        {kIdConfig, L"打开配置"},
+        {kIdScan, L"手动扫描"},        {kIdRules, L"规则管理"},
         {kIdAllowLast, L"临时放行"},   {kIdWatchdog, L"看门狗"},
         {kIdServiceCtrl, L"启动服务"}, {kIdHide, L"隐藏到托盘"},
         {kIdExit, L"退出"},
@@ -414,6 +416,17 @@ void AllowLastTarget() {
     }
 }
 
+// 打开规则管理界面。关闭后顺手刷新一次状态与日志：
+// 用户很可能刚保存了新规则，状态区能立刻反映"启用规则数"的变化。
+void OpenRuleManager() {
+    if (g_uiFont == nullptr) {
+        return;
+    }
+    GuardDog::ShowRuleManagerDialog(g_mainWindow, g_uiFont);
+    RefreshStatus();
+    RefreshLog();
+}
+
 // 查询主服务当前是否在运行（用于决定按钮文字）
 bool IsMainServiceRunning() {
     SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
@@ -509,7 +522,8 @@ void ShowAbout() {
     ShowInfo(std::wstring(L"GuardDog ") + GuardDog::Constants::kVersion + L"\n" +
              GuardDog::Constants::kBuildStage +
              L"\n\n纯用户态防流氓软件防护工具。\n"
-             L"服务端负责监控与清理，本界面仅用于查看状态。\n\n"
+             L"服务端负责监控与清理；本界面用于查看状态，"
+             L"并可通过「规则管理」可视化编辑拦截规则与防护开关。\n\n"
              L"当前启动模式：" + mode + L"（在配置文件的 startup_mode 中修改）\n"
              L"关闭窗口只是隐藏到托盘，退出程序也不会停止防护服务。");
 }
@@ -548,7 +562,8 @@ void ShowTrayMenu(HWND window) {
     AppendMenuW(menu, MF_STRING, kIdServiceCtrl,
                 IsMainServiceRunning() ? L"停止防护服务" : L"启动防护服务");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING, kIdConfig, L"打开配置文件");
+    AppendMenuW(menu, MF_STRING, kIdRules, L"规则管理（可视化配置）");
+    AppendMenuW(menu, MF_STRING, kIdConfig, L"打开配置文件（高级）");
     AppendMenuW(menu, MF_STRING, kIdAbout, L"关于");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, kIdExit, L"退出（不影响防护）");
@@ -571,6 +586,7 @@ void ShowTrayMenu(HWND window) {
         case kIdAllowLast:  AllowLastTarget(); break;
         case kIdWatchdog:   ShowWatchdogStatus(); break;
         case kIdServiceCtrl: ControlMainService(!IsMainServiceRunning()); break;
+        case kIdRules:      OpenRuleManager(); break;
         case kIdConfig:     OpenConfig(); break;
         case kIdAbout:      ShowAbout(); break;
         case kIdHide:       HideMainWindow(); break;
@@ -584,6 +600,7 @@ void HandleCommand(int id) {
         case kIdRefresh:    RefreshStatus(); RefreshLog(); break;
         case kIdFullLog:    OpenFullLog(); break;
         case kIdScan:       RunScan(); break;
+        case kIdRules:      OpenRuleManager(); break;
         case kIdConfig:     OpenConfig(); break;
         case kIdAllowLast:  AllowLastTarget(); break;
         case kIdWatchdog:   ShowWatchdogStatus(); break;

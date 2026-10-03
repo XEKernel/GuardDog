@@ -6,12 +6,13 @@
 
 namespace GuardDog {
 
-// 极简 JSON 解析器（只读）。
+// 极简 JSON 解析器 + 最小序列化器。
 //
 // 为什么自实现而不用第三方库：本项目定位是"零外部依赖、离线可编译"，
 // 而 GuardDog 配置的语法复杂度很低（对象 / 数组 / 字符串 / 数字 / 布尔 / null），
 // 自实现的代码量与审计成本都低于引入一个几百 KB 的头文件库。
-// 只实现读取：配置文件由用户编辑，程序不负责回写，因此不需要序列化能力。
+// 写侧只实现规则编辑界面所需的最小集合（构造、覆写、追加、序列化），
+// 不做完整的文档模型——保留原始树 + 覆写目标字段即可，避免回写时丢掉未知字段。
 class JsonValue {
 public:
     enum class Type { Null, Bool, Number, String, Array, Object };
@@ -42,7 +43,9 @@ public:
     bool Has(const std::wstring& key) const noexcept;
 
     const std::vector<JsonValue>& GetArray() const noexcept { return m_array; }
-    const std::vector<std::pair<std::wstring, JsonValue>>& GetObject() const noexcept {
+    // 注意：刻意不叫 GetObject——windows.h 把 GetObject 定义成了宏（GDI 的 GetObjectW），
+    // 任何包含 windows.h 的翻译单元调用该名字都会被宏展开成 GetObjectW
+    const std::vector<std::pair<std::wstring, JsonValue>>& GetMembers() const noexcept {
         return m_object;
     }
 
@@ -50,6 +53,23 @@ public:
     static JsonValue ParseUtf8(const std::string& text, std::wstring* error);
     // 读文件并解析：自动处理 UTF-8 BOM，UTF-8 解码失败时回退系统代码页（兼容记事本存成 ANSI 的情况）
     static JsonValue ParseFile(const std::wstring& path, std::wstring* error);
+
+    // ---- 写侧：构造与修改（供规则编辑界面回写配置）----
+    static JsonValue MakeObject();
+    static JsonValue MakeArray();
+    static JsonValue MakeString(std::wstring text);
+    static JsonValue MakeNumber(double number);
+    static JsonValue MakeBool(bool value);
+
+    // 对象：同名成员存在则替换，不存在则追加。
+    // 追加而非重建整个对象，是为了尽量保留用户手工写在配置里的未知字段。
+    void Set(const std::wstring& key, JsonValue value);
+    // 数组：追加元素；非数组类型时忽略（宽松处理，避免调用方到处判类型）
+    void PushBack(JsonValue value);
+
+    // 序列化为 UTF-8 文本（带缩进、CRLF 换行，方便用户直接用记事本查看）。
+    // indentSpaces 为每层缩进空格数，0 表示紧凑输出。
+    std::string SerializeUtf8(int indentSpaces = 2) const;
 
 private:
     static const JsonValue& NullValue() noexcept;

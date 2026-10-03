@@ -8,8 +8,8 @@ namespace GuardDog {
 namespace Constants {
 
 // ---- 版本 ----
-inline constexpr wchar_t kVersion[]  = L"1.1.0";
-inline constexpr wchar_t kBuildStage[] = L"阶段三-托盘 UI 与命名管道 IPC";
+inline constexpr wchar_t kVersion[]  = L"1.4.0";
+inline constexpr wchar_t kBuildStage[] = L"阶段四-安装拦截与规则管理界面";
 
 // ---- 主服务标识 ----
 inline constexpr wchar_t kServiceName[]        = L"GuardDogService";

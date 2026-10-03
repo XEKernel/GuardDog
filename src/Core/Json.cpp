@@ -480,4 +480,203 @@ JsonValue JsonValue::ParseFile(const std::wstring& path, std::wstring* error) {
     return ParseUtf8(bytes, error);
 }
 
+// ---------------------------------------------------------------------------
+// 写侧实现
+// ---------------------------------------------------------------------------
+
+namespace {
+
+std::string ToUtf8(const std::wstring& text) {
+    if (text.empty()) {
+        return std::string();
+    }
+
+    // 不传 WC_ERR_INVALID_CHARS：对未配对的代理码元按替换字符处理，
+    // 而不是让整次转换失败——配置文本出现个别异常字符时仍应能写出去。
+    const int length = WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()),
+                                           nullptr, 0, nullptr, nullptr);
+    if (length <= 0) {
+        return std::string();
+    }
+
+    std::string result(static_cast<size_t>(length), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), result.data(), length,
+                        nullptr, nullptr);
+    return result;
+}
+
+void AppendEscapedString(const std::wstring& text, std::string& out) {
+    out.push_back('"');
+
+    // 先转 UTF-8 再逐字节转义：多字节序列的每个字节都 >= 0x80，
+    // 不会与控制字符 / 引号 / 反斜杠的判定冲突，转义逻辑因此可以按字节做。
+    const std::string utf8 = ToUtf8(text);
+    for (const char rawByte : utf8) {
+        const unsigned char byte = static_cast<unsigned char>(rawByte);
+        switch (byte) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\b': out += "\\b"; break;
+            case '\f': out += "\\f"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default:
+                if (byte < 0x20) {
+                    // 其余控制字符走 \u00XX 形式（JSON 规范不允许裸控制字符）
+                    char buffer[8] = {};
+                    sprintf_s(buffer, "\\u%04x", byte);
+                    out += buffer;
+                } else {
+                    out.push_back(rawByte);
+                }
+                break;
+        }
+    }
+
+    out.push_back('"');
+}
+
+void AppendNumber(double number, std::string& out) {
+    char buffer[40] = {};
+
+    // 整数值按整数输出：500 写成 "500" 而不是 "500.0"，
+    // 配置回写后看起来和用户手写的一致。
+    if (number > -1e15 && number < 1e15 && number == static_cast<double>(static_cast<long long>(number))) {
+        sprintf_s(buffer, "%lld", static_cast<long long>(number));
+    } else {
+        sprintf_s(buffer, "%.10g", number);
+    }
+    out += buffer;
+}
+
+void SerializeValue(const JsonValue& value, int indentSpaces, int depth, std::string& out) {
+    switch (value.GetType()) {
+        case JsonValue::Type::Null:
+            out += "null";
+            return;
+        case JsonValue::Type::Bool:
+            out += value.AsBool() ? "true" : "false";
+            return;
+        case JsonValue::Type::Number:
+            AppendNumber(value.AsNumber(), out);
+            return;
+        case JsonValue::Type::String:
+            AppendEscapedString(value.AsString(), out);
+            return;
+        case JsonValue::Type::Array: {
+            const std::vector<JsonValue>& items = value.GetArray();
+            if (items.empty()) {
+                out += "[]";
+                return;
+            }
+            out.push_back('[');
+            for (size_t i = 0; i < items.size(); ++i) {
+                if (i > 0) {
+                    out.push_back(',');
+                }
+                if (indentSpaces > 0) {
+                    out += "\r\n";
+                    out.append(static_cast<size_t>((depth + 1) * indentSpaces), ' ');
+                }
+                SerializeValue(items[i], indentSpaces, depth + 1, out);
+            }
+            if (indentSpaces > 0) {
+                out += "\r\n";
+                out.append(static_cast<size_t>(depth * indentSpaces), ' ');
+            }
+            out.push_back(']');
+            return;
+        }
+        case JsonValue::Type::Object: {
+            const std::vector<std::pair<std::wstring, JsonValue>>& members = value.GetMembers();
+            if (members.empty()) {
+                out += "{}";
+                return;
+            }
+            out.push_back('{');
+            for (size_t i = 0; i < members.size(); ++i) {
+                if (i > 0) {
+                    out.push_back(',');
+                }
+                if (indentSpaces > 0) {
+                    out += "\r\n";
+                    out.append(static_cast<size_t>((depth + 1) * indentSpaces), ' ');
+                }
+                AppendEscapedString(members[i].first, out);
+                out += (indentSpaces > 0) ? ": " : ":";
+                SerializeValue(members[i].second, indentSpaces, depth + 1, out);
+            }
+            if (indentSpaces > 0) {
+                out += "\r\n";
+                out.append(static_cast<size_t>(depth * indentSpaces), ' ');
+            }
+            out.push_back('}');
+            return;
+        }
+    }
+}
+
+} // namespace
+
+JsonValue JsonValue::MakeObject() {
+    JsonValue value;
+    value.m_type = Type::Object;
+    return value;
+}
+
+JsonValue JsonValue::MakeArray() {
+    JsonValue value;
+    value.m_type = Type::Array;
+    return value;
+}
+
+JsonValue JsonValue::MakeString(std::wstring text) {
+    JsonValue value;
+    value.m_type = Type::String;
+    value.m_string = std::move(text);
+    return value;
+}
+
+JsonValue JsonValue::MakeNumber(double number) {
+    JsonValue value;
+    value.m_type = Type::Number;
+    value.m_number = number;
+    return value;
+}
+
+JsonValue JsonValue::MakeBool(bool state) {
+    JsonValue value;
+    value.m_type = Type::Bool;
+    value.m_bool = state;
+    return value;
+}
+
+void JsonValue::Set(const std::wstring& key, JsonValue value) {
+    if (m_type != Type::Object) {
+        return;
+    }
+    for (std::pair<std::wstring, JsonValue>& member : m_object) {
+        if (member.first == key) {
+            member.second = std::move(value);
+            return;
+        }
+    }
+    m_object.emplace_back(key, std::move(value));
+}
+
+void JsonValue::PushBack(JsonValue value) {
+    if (m_type != Type::Array) {
+        return;
+    }
+    m_array.push_back(std::move(value));
+}
+
+std::string JsonValue::SerializeUtf8(int indentSpaces) const {
+    std::string out;
+    out.reserve(2048);
+    SerializeValue(*this, indentSpaces < 0 ? 0 : indentSpaces, 0, out);
+    return out;
+}
+
 } // namespace GuardDog

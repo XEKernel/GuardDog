@@ -8,6 +8,16 @@
 
 namespace GuardDog {
 
+// 见头文件中的前向声明说明。放在 GuardDog 命名空间（而非匿名命名空间）是因为
+// 头文件的 shared_ptr<WmiMonitorState> 成员必须按名引用到同一个类型。
+struct WmiMonitorState {
+    std::mutex mutex;
+    WmiMonitor::ProcessCallback callback;
+    bool connected = false;
+    std::atomic<bool> running{false};
+    std::atomic<bool> needsReconnect{false};
+};
+
 namespace {
 
 // 从 WMI 对象里读一个整数属性。
@@ -87,9 +97,13 @@ ComPtr<IWbemClassObject> QueryTargetInstance(IWbemClassObject* eventObject) {
 
 // IWbemObjectSink 实现：WMI 会从自己的线程池回调这里。
 // 回调里只做"解析 + 投递"，绝不执行挂起/终止等耗时动作，否则会拖慢后续事件投递。
+//
+// sink 持有 WmiMonitorState 的 shared_ptr 而非 WmiMonitor 指针：即使 WmiMonitor
+// 实例（乃至其所在作用域）已经销毁，sink 及在途回调操作的状态依然有效，
+// 从根本上消除 use-after-free。
 class ProcessStartSink final : public IWbemObjectSink {
 public:
-    explicit ProcessStartSink(WmiMonitor* owner) : m_owner(owner) {}
+    explicit ProcessStartSink(std::shared_ptr<WmiMonitorState> state) : m_state(std::move(state)) {}
 
     // ---- IUnknown ----
     ULONG STDMETHODCALLTYPE AddRef() override {
@@ -135,8 +149,11 @@ public:
                                         IWbemClassObject* /*objParam*/) override {
         // WBEM_STATUS_COMPLETE + 失败 = 订阅已经结束（例如 WMI 服务重启）。
         // 此时必须让上层知道，否则会以为"事件监控还在工作"而放松轮询。
+        // 这里只更新共享状态，绝不触碰 WmiMonitor 实例——它可能已经被销毁。
         if ((flags & WBEM_STATUS_COMPLETE) != 0 && FAILED(result)) {
-            m_owner->OnSubscriptionBroken(result);
+            GD_LOG_WARN(L"WMI 订阅已中断（0x%08X）：期间仅靠轮询兜底，稍后将尝试重建订阅", result);
+            m_state->running.store(false);
+            m_state->needsReconnect.store(true);
         }
         return WBEM_S_NO_ERROR;
     }
@@ -160,40 +177,65 @@ private:
             return;
         }
 
-        m_owner->OnProcessStarted(processId, processName);
+        // 复制回调到局部变量后立即解锁：回调体可能再次获取本锁，锁内调用会死锁。
+        // connected 闸门保证 Stop() 之后到达的回调被丢弃。
+        WmiMonitor::ProcessCallback callback;
+        {
+            std::lock_guard<std::mutex> lock(m_state->mutex);
+            if (!m_state->connected) {
+                return;
+            }
+            callback = m_state->callback;
+        }
+
+        GD_LOG_DEBUG(L"WMI 事件：进程创建 pid=%lu 名称=%s", processId,
+                     processName.empty() ? L"(未知)" : processName.c_str());
+
+        if (callback) {
+            callback(processId, processName);
+        }
     }
 
     volatile LONG m_refCount = 1;
-    WmiMonitor* m_owner = nullptr;
+    std::shared_ptr<WmiMonitorState> m_state;
 };
 
-WmiMonitor::WmiMonitor() = default;
+WmiMonitor::WmiMonitor() : m_state(std::make_shared<WmiMonitorState>()) {}
 
 WmiMonitor::~WmiMonitor() {
     Stop();
 }
 
-void WmiMonitor::OnProcessStarted(DWORD processId, const std::wstring& processName) {
-    GD_LOG_DEBUG(L"WMI 事件：进程创建 pid=%lu 名称=%s", processId,
-                 processName.empty() ? L"(未知)" : processName.c_str());
-
-    if (m_callback) {
-        m_callback(processId, processName);
-    }
+bool WmiMonitor::IsRunning() const {
+    return m_state != nullptr && m_state->running.load();
 }
 
-void WmiMonitor::OnSubscriptionBroken(HRESULT result) {
-    GD_LOG_WARN(L"WMI 订阅已中断（0x%08X）：期间仅靠轮询兜底，稍后将尝试重建订阅", result);
-    m_running.store(false);
-    m_needsReconnect.store(true);
+bool WmiMonitor::NeedsReconnect() const {
+    return m_state != nullptr && m_state->needsReconnect.load();
+}
+
+void WmiMonitor::ClearReconnectFlag() {
+    if (m_state != nullptr) {
+        m_state->needsReconnect.store(false);
+    }
 }
 
 HRESULT WmiMonitor::Start(const ProcessCallback& callback) {
-    if (m_running.load()) {
+    // 名义上构造时已创建，这里兜底判断，保证任何情况下 m_state 都可用
+    if (m_state == nullptr) {
+        m_state = std::make_shared<WmiMonitorState>();
+    }
+    if (m_state->running.load()) {
         return S_OK;
     }
 
-    m_callback = callback;
+    // 先写入回调并关闭 connected 闸门；只有 ExecNotificationQueryAsync 成功后才
+    // 重新打开。这样即使 WMI 在订阅过程中就投递了事件，也不会触发未就绪的回调。
+    {
+        std::lock_guard<std::mutex> lock(m_state->mutex);
+        m_state->callback = callback;
+        m_state->connected = false;
+    }
 
     // 必须按 MTA 初始化：异步订阅的回调由 RPC 线程池投递，
     // 若用 STA 就需要消息泵，而服务进程没有消息循环。
@@ -245,7 +287,7 @@ HRESULT WmiMonitor::Start(const ProcessCallback& callback) {
     BSTR language = SysAllocString(L"WQL");
     BSTR query = SysAllocString(L"SELECT * FROM Win32_ProcessStartTrace");
 
-    ProcessStartSink* sink = new ProcessStartSink(this);
+    ProcessStartSink* sink = new ProcessStartSink(m_state);
     hr = m_service->ExecNotificationQueryAsync(language, query, WBEM_FLAG_SEND_STATUS, nullptr, sink);
 
     SysFreeString(language);
@@ -260,13 +302,28 @@ HRESULT WmiMonitor::Start(const ProcessCallback& callback) {
     }
 
     m_sink.Attach(sink);
-    m_running.store(true);
-    m_needsReconnect.store(false);
+
+    // 订阅已受理，打开回调闸门；随后到达的事件才会被投递给上层
+    {
+        std::lock_guard<std::mutex> lock(m_state->mutex);
+        m_state->connected = true;
+    }
+    m_state->running.store(true);
+    m_state->needsReconnect.store(false);
     GD_LOG_INFO(L"WMI 订阅已建立：Win32_ProcessStartTrace（进程创建即时通知，作为主监控手段）");
     return S_OK;
 }
 
 void WmiMonitor::Stop() {
+    // 必须在 CancelAsyncCall 之前先断开 connected 并清空回调：
+    // CancelAsyncCall 不等待在途回调返回，只有先关闭这个闸门，正在执行的
+    // HandleEvent 才会在复制回调前看到 connected=false 而直接返回。
+    if (m_state != nullptr) {
+        std::lock_guard<std::mutex> lock(m_state->mutex);
+        m_state->connected = false;
+        m_state->callback = nullptr;
+    }
+
     if (m_service.IsValid() && m_sink.IsValid()) {
         const HRESULT hr = m_service->CancelAsyncCall(m_sink.Get());
         if (FAILED(hr) && hr != WBEM_E_INVALID_OPERATION) {
@@ -277,8 +334,10 @@ void WmiMonitor::Stop() {
     m_sink.Reset();
     m_service.Reset();
     m_locator.Reset();
-    m_callback = nullptr;
-    m_running.store(false);
+
+    if (m_state != nullptr) {
+        m_state->running.store(false);
+    }
 
     if (m_comInitialized) {
         CoUninitialize();

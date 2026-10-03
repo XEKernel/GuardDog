@@ -2,6 +2,7 @@
 
 #include <windows.h>
 
+#include <atomic>
 #include <cstdarg>
 #include <mutex>
 #include <string>
@@ -33,8 +34,8 @@ public:
     HRESULT Initialize(const std::wstring& logDir = std::wstring());
     void Shutdown();
 
-    void SetLevel(LogLevel level) noexcept { m_level = level; }
-    LogLevel GetLevel() const noexcept { return m_level; }
+    void SetLevel(LogLevel level) noexcept { m_level.store(level); }
+    LogLevel GetLevel() const noexcept { return m_level.load(); }
 
     // 解析 "debug"/"info"/"warn"/"error"（大小写不敏感），非法值回退 Info
     static LogLevel ParseLevel(const std::wstring& text) noexcept;
@@ -72,7 +73,9 @@ private:
     std::wstring      m_dir;
     std::wstring      m_currentPath;
     int               m_currentDayStamp = 0;   // YYYYMMDD
-    LogLevel          m_level = LogLevel::Info;
+    // 原子类型：SetLevel 可能由控制线程调用，而 LogV 在 WMI 回调等多个线程上读取，
+    // 非原子读写构成数据竞争。
+    std::atomic<LogLevel> m_level{LogLevel::Info};
     bool              m_initialized = false;
 };
 

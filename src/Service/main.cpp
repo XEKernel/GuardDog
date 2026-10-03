@@ -723,10 +723,13 @@ void WINAPI ServiceMain(DWORD /*argc*/, LPWSTR* /*argv*/) {
     // 挂起进程或清理自启动项，贸然退出会留下半完成状态）
     const DWORD waitResult = WaitForSingleObject(g_workerThread, kWorkerWaitOnStopMs);
     if (waitResult == WAIT_TIMEOUT) {
-        // 不调用 TerminateThread：强杀线程会让文件/注册表句柄处于未定义状态，
-        // 这里只记录，随后由进程退出统一回收资源。
-        GD_LOG_WARN(L"等待工作线程退出超时（%lu 毫秒），继续执行收尾",
+        // 超时说明工作线程可能仍在写日志、使用 g_stopEvent。此时关闭句柄或
+        // Shutdown 日志会让在途操作触碰已销毁对象；而进程即将退出，交由系统
+        // 统一回收比显式收尾更安全。ReportStatus 自身不依赖 Logger，可安全上报。
+        GD_LOG_WARN(L"等待工作线程退出超时（%lu 毫秒），跳过显式收尾，由进程退出统一回收",
                     kWorkerWaitOnStopMs);
+        ReportStatus(SERVICE_STOPPED, NO_ERROR, 0);
+        return;
     }
 
     if (g_workerThread != nullptr) {

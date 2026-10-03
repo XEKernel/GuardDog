@@ -171,7 +171,7 @@ void Logger::LogBackup(const wchar_t* category, const wchar_t* item,
 }
 
 void Logger::LogV(LogLevel level, const wchar_t* format, va_list args) {
-    if (static_cast<int>(level) < static_cast<int>(m_level)) {
+    if (static_cast<int>(level) < static_cast<int>(m_level.load())) {
         return;
     }
 

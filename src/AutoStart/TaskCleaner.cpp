@@ -4,6 +4,7 @@
 #include "Core/Logger.h"
 #include "Core/ProcessRunner.h"
 
+#include <utility>
 #include <vector>
 
 namespace GuardDog {
@@ -36,6 +37,50 @@ std::vector<std::wstring> ExtractTagValues(const std::wstring& xml, const std::w
     }
 
     return values;
+}
+
+// 按"动作块"解析出 (Command, Arguments) 对。
+//
+// 不能分别取出全部 <Command> 与全部 <Arguments> 再按下标配对：若前面某个动作
+// 没有 <Arguments>，后面的参数会错配到前一个命令上，导致黑名单匹配遗漏或误判。
+// 因此对每个 <Command>，只在其之后、下一个 <Command> 之前寻找第一个 <Arguments>。
+std::vector<std::pair<std::wstring, std::wstring>> ExtractExecActions(const std::wstring& xml) {
+    const std::wstring commandOpen = L"<Command>";
+    const std::wstring commandClose = L"</Command>";
+
+    std::vector<std::pair<std::wstring, std::wstring>> actions;
+
+    size_t position = 0;
+    for (;;) {
+        const size_t commandStart = xml.find(commandOpen, position);
+        if (commandStart == std::wstring::npos) {
+            break;
+        }
+        const size_t commandEnd = xml.find(commandClose, commandStart);
+        if (commandEnd == std::wstring::npos) {
+            break;
+        }
+
+        const std::wstring command = xml.substr(
+            commandStart + commandOpen.size(), commandEnd - commandStart - commandOpen.size());
+        position = commandEnd + commandClose.size();
+
+        // 参数必须属于同一个动作块：只在"本 Command 之后、下一个 Command 之前"
+        // 这段子串里找 <Arguments>，找不到就是空串，不会借用到别的动作的参数。
+        const size_t nextCommand = xml.find(commandOpen, position);
+        const size_t searchLimit = nextCommand == std::wstring::npos ? xml.size() : nextCommand;
+
+        std::wstring arguments;
+        const std::vector<std::wstring> blockArguments =
+            ExtractTagValues(xml.substr(position, searchLimit - position), L"Arguments");
+        if (!blockArguments.empty()) {
+            arguments = blockArguments.front();
+        }
+
+        actions.emplace_back(command, arguments);
+    }
+
+    return actions;
 }
 
 void CollectTaskFiles(const std::wstring& directory, std::vector<std::wstring>& files, int depth) {
@@ -122,11 +167,10 @@ CleanResult CleanScheduledTasks(const Config& config, const AutoStartTarget& /*t
             continue;
         }
 
-        const std::vector<std::wstring> commands = ExtractTagValues(xml, L"Command");
-        if (commands.empty()) {
+        const std::vector<std::pair<std::wstring, std::wstring>> actions = ExtractExecActions(xml);
+        if (actions.empty()) {
             continue;  // 不是可执行型任务
         }
-        const std::vector<std::wstring> arguments = ExtractTagValues(xml, L"Arguments");
 
         ++result.scanned;
 
@@ -135,13 +179,13 @@ CleanResult CleanScheduledTasks(const Config& config, const AutoStartTarget& /*t
             continue;
         }
 
-        // 逐个 <Command> 判定（一个任务可能有多个动作）
+        // 逐个动作判定（一个任务可能有多个动作），任一命中即视为命中
         bool hit = false;
         std::wstring hitDetail;
-        for (size_t i = 0; i < commands.size(); ++i) {
-            std::wstring commandLine = commands[i];
-            if (i < arguments.size() && !arguments[i].empty()) {
-                commandLine += L" " + arguments[i];
+        for (const auto& action : actions) {
+            std::wstring commandLine = action.first;
+            if (!action.second.empty()) {
+                commandLine += L" " + action.second;
             }
             if (IsTargetCommand(config, commandLine)) {
                 hit = true;
